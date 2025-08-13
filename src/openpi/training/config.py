@@ -16,10 +16,13 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0 as pi0
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi0_fql as pi0_fql
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+# LARR ur3 data config added
+import openpi.policies.ur3_policy as ur3_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -92,6 +95,10 @@ class DataConfig:
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
+
+    dataset_dir: str | None = '/ssd1/openpi/datasets/libero_fql'
+    fql: bool = False
+    chunk_Q: bool = False
 
 
 class GroupFactory(Protocol):
@@ -327,6 +334,103 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotLiberoFQLDataConfig(DataConfigFactory):
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                        "reward": "reward",
+                        "next_state": "next_state",
+                        "next_image": "next_image",
+                        "next_wrist_image": "next_wrist_image",
+                        "terminal": "terminal",
+                        "actions_is_pad": "actions_is_pad",
+                        "reward_is_pad": "reward_is_pad",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                libero_policy.LiberoFQLInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)
+            ],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        # # the delta action transform
+        # delta_action_mask = _transforms.make_bool_mask(6, -1)
+        # data_transforms = data_transforms.push(
+        #     inputs=[_transforms.DeltaActions(delta_action_mask)],
+        #     outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        # )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        # You do not need to change anything here for your own dataset.
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotUR3DataConfig(DataConfigFactory):
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # key : new keys / values : flattented paths to the old keys
+                        "observation/image/base_image": "observation/image/base_image",
+                        "observation/image/wrist_image": "observation/image/wrist_image",
+                        "observation/state": "observation/state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[ur3_policy.UR3Inputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[ur3_policy.UR3Outputs()],
+        )
+
+        # Convert absolute actions to delta actions.
+        # By convention, we do not convert the gripper action (7th dimension).
+        # delta_action_mask = _transforms.make_bool_mask(6, -1)
+        # data_transforms = data_transforms.push(
+        #     inputs=[_transforms.DeltaActions(delta_action_mask)],
+        #     outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        # )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        # You do not need to change anything here for your own dataset.
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -398,8 +502,15 @@ class TrainConfig:
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
+    lr_schedule_critic: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
+    tau_target: float | None = 0.005
+    rl_loss_coef: float | None = 0.5
+    rl_warmup_steps: float | None = 20
+    alpha_q: float | None = 1.0
+    critic_updates_per_step : int | None = 1
+    actor_warmup_steps: int | None = 3_000
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
@@ -728,6 +839,146 @@ _CONFIGS = [
         exp_name="debug",
         num_train_steps=10,
         wandb_enabled=False,
+    ),
+
+
+    #
+    # LARR UR3 configs
+    #
+    # pi0-fast + LoRA로 ur3
+    TrainConfig(
+        name="pi0_fast_ur3_low_mem_finetune",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ),
+        data=LeRobotUR3DataConfig(
+            # TODO ur3 dataset repo
+            repo_id="ur3_dataset",
+            # This config lets us reload the UR5 normalization stats from the base model checkpoint.
+            # Reloading normalization stats can help transfer pre-trained models to new environments.
+            # See the [norm_stats.md](../docs/norm_stats.md) file for more details.
+            # TODO ur3 <-> ur5e normalization stats 비교해서 사용할 수 있으면 사용
+            # 안될듯?? ur3용 normalization statics 필요
+            assets=AssetsConfig(
+                assets_dir="s3://openpi-assets/checkpoints/pi0_fast_base/assets",
+                asset_id="ur5e",
+            ),
+            base_config=DataConfig(
+                # This flag determines whether we load the prompt (i.e. the task instruction) from the
+                # ``task`` field in the LeRobot dataset. The recommended setting is True.
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        # Again, make sure to match the model config above when extracting the freeze filter
+        # that specifies which parameters should be frozen during LoRA finetuning.
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size=32,
+        wandb_enabled=True,
+        save_interval=1000,
+        resume=False,
+        overwrite=False,
+    ),
+    # pi0 + LoRA로 ur3
+    TrainConfig(
+        name="pi0_ur3_low_mem_finetune",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora", action_dim=7),
+        data=LeRobotUR3DataConfig(
+            # TODO ur3 dataset repo
+            repo_id="ur3_dataset",
+            # This config lets us reload the UR5 normalization stats from the base model checkpoint.
+            # Reloading normalization stats can help transfer pre-trained models to new environments.
+            # See the [norm_stats.md](../docs/norm_stats.md) file for more details.
+            # TODO ur3 <-> ur5e normalization stats 비교해서 사용할 수 있으면 사용
+            assets=AssetsConfig(
+                assets_dir="s3://openpi-assets/checkpoints/pi0_base/assets",
+                asset_id="ur5e",
+            ),
+            base_config=DataConfig(
+                # This flag determines whether we load the prompt (i.e. the task instruction) from the
+                # ``task`` field in the LeRobot dataset. The recommended setting is True.
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        # Again, make sure to match the model config above when extracting the freeze filter
+        # that specifies which parameters should be frozen during LoRA finetuning.
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size=32,
+        wandb_enabled=True,
+        save_interval=1000,
+        resume=False,
+        overwrite=False,
+    ),
+    TrainConfig(
+        name="pi0_fql_libero_lora_finetune",
+        project_name="openpi",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_fql.Pi0FQLConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            discount=0.99,
+            normalize_q_loss = False,
+            action_horizon=50,
+        ),
+        data=LeRobotLiberoFQLDataConfig(
+            repo_id="libero_fql",
+            base_config=DataConfig(prompt_from_task=True, fql=True, chunk_Q=True),
+        ),
+        assets_base_dir="./datasets",
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0_fql.Pi0FQLConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            discount=0.99,
+            normalize_q_loss = False,
+            action_horizon=50,
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        
+        log_interval=10,
+        save_interval=2500,
+        keep_period=5000,
+        overwrite=True,
+        resume=False,
+        exp_name="exp1",
+        wandb_enabled=True,
+        batch_size=36,
+        tau_target = 0.005,
+        rl_loss_coef = 1.0,
+        rl_warmup_steps = 6000,
+        alpha_q = 1.0,
+        lr_schedule = _optimizer.CosineDecaySchedule_actor(
+            warmup_steps = 1_000,
+            peak_lr = 2.5e-5,
+            decay_steps = 30_000,
+            decay_lr = 2.5e-6,
+        ),
+        lr_schedule_critic = _optimizer.CosineDecaySchedule_critic(
+            warmup_steps = 1_000,
+            peak_lr = 2.5e-5,
+            decay_steps = 30_000,
+            decay_lr = 2.5e-6,
+        ),
+        critic_updates_per_step=1,
+        seed = 64,
+        actor_warmup_steps=3_000,
     ),
 ]
 

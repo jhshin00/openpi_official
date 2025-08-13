@@ -163,6 +163,8 @@ class Unnormalize(DataTransformFn):
             self.norm_stats,
             self._unnormalize_quantile if self.use_quantiles else self._unnormalize,
             strict=True,
+            # strict=False,
+            # 왜했었지
         )
 
     def _unnormalize(self, x, stats: NormStats):
@@ -181,6 +183,8 @@ class ResizeImages(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        if "next_image" in data:
+            data["next_image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["next_image"].items()}
         return data
 
 
@@ -388,7 +392,10 @@ def apply_tree(
     if strict:
         for k in selector:
             if k not in tree:
-                raise ValueError(f"Selector key {k} not found in tree")
+                if k in ["next_state", "next_image", "next_wrist_image"]:
+                    continue
+                else:
+                    raise ValueError(f"Selector key {k} not found in tree")
 
     return unflatten_dict({k: transform(k, v) for k, v in tree.items()})
 

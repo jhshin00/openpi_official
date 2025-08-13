@@ -30,6 +30,43 @@ class CosineDecaySchedule(LRScheduleConfig):
             end_value=self.decay_lr,
         )
 
+## lr schedule for actor-critic
+@dataclasses.dataclass(frozen=True)
+class CosineDecaySchedule_critic(LRScheduleConfig):
+    """Cosine decay schedule with warmup."""
+
+    warmup_steps: int = 1_000
+    peak_lr: float = 2.5e-5
+    decay_steps: int = 30_000
+    decay_lr: float = 2.5e-6
+
+    def create(self) -> optax.Schedule:
+        return optax.warmup_cosine_decay_schedule(
+            init_value=self.peak_lr / (self.warmup_steps + 1),
+            peak_value=self.peak_lr,
+            warmup_steps=self.warmup_steps,
+            decay_steps=self.decay_steps,
+            end_value=self.decay_lr,
+        )
+        
+@dataclasses.dataclass(frozen=True)
+class CosineDecaySchedule_actor(LRScheduleConfig):
+    """Cosine decay schedule with warmup."""
+
+    warmup_steps: int = 1_000
+    peak_lr: float = 2.5e-5
+    decay_steps: int = 30_000
+    decay_lr: float = 2.5e-6
+
+    def create(self) -> optax.Schedule:
+        return optax.warmup_cosine_decay_schedule(
+            init_value=self.peak_lr / (self.warmup_steps + 1),
+            peak_value=self.peak_lr,
+            warmup_steps=self.warmup_steps,
+            decay_steps=self.decay_steps,
+            end_value=self.decay_lr,
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class RsqrtDecaySchedule(LRScheduleConfig):

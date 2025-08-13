@@ -32,11 +32,14 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
     ):
         self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+        if hasattr(model, "critic"):
+            self._critic = model.critic
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
         self._rng = rng or jax.random.key(0)
         self._sample_kwargs = sample_kwargs or {}
         self._metadata = metadata or {}
+        # self._model = model
 
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
@@ -47,10 +50,21 @@ class Policy(BasePolicy):
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
 
         start_time = time.monotonic()
-        self._rng, sample_rng = jax.random.split(self._rng)
+        self._rng, sample_rng, critic_rng = jax.random.split(self._rng, 3)
+
+        actions = self._sample_actions(sample_rng, _model.Observation.from_dict(inputs), **self._sample_kwargs)
+
+        q_value = None
+        if hasattr(self, "_critic"):
+            q_value = self._critic(
+                _model.Observation.from_dict(inputs),
+                actions,
+                train=False,
+            )
+        q_value = np.asarray(q_value[0, ...])
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng, _model.Observation.from_dict(inputs), **self._sample_kwargs),
+            "actions": actions
         }
         # Unbatch and convert to np.ndarray.        # Unbatch and convert to np.ndarray.
         outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
@@ -60,6 +74,7 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        outputs["q_value"] = q_value
         return outputs
 
     @property

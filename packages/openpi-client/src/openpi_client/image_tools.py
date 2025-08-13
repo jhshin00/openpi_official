@@ -24,6 +24,25 @@ def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BI
     Returns:
         The resized images in [..., height, width, channel].
     """
+    # Handle case where images are in [..., batch, channel, height, width] format
+    # Only transpose if it's actually (C, H, W) format, not (H, W, C)
+    if (images.shape[-1] in [height, width] and 
+        images.shape[-2] in [height, width] and 
+        images.shape[-3] == 3 and
+        images.shape[-1] != images.shape[-2]):  # Make sure it's not already (H, W, C)
+        # This looks like [..., batch, channel, height, width] format
+        # Transpose to [..., batch, height, width, channel] format
+        images = np.transpose(images, list(range(images.ndim - 4)) + [-3, -1, -2])
+    
+    # Handle chunk dimension: if we have (1, H, W, C) from chunk processing
+    if (images.ndim == 4 and 
+        images.shape[-4] == 1 and 
+        images.shape[-3] in [height, width] and 
+        images.shape[-2] in [height, width] and 
+        images.shape[-1] == 3):
+        # This is (1, H, W, C) from chunk processing, squeeze the first dimension
+        images = images.squeeze(0)  # Remove the chunk dimension
+    
     # If the images are already the correct size, return them as is.
     if images.shape[-3:-1] == (height, width):
         return images

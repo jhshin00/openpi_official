@@ -1,0 +1,73 @@
+name: openpi
+channels:
+  - nvidia           # cuda-toolkit, tensorflow-cpu 용
+  - conda-forge
+  - defaults
+
+dependencies:
+  # ─── Conda 패키지 ─────────────────────────────────────────────────────────
+  - python=3.11
+  - pip
+  - cuda-toolkit=12.0.0      # GPU 필요 없으면 삭제 가능
+  - tensorflow-cpu=2.15.0    # CPU 전용 TF
+
+  # ─── pip 패키지 ──────────────────────────────────────────────────────────
+  - pip:
+    # editable install
+    - -e .
+
+    # 로컬 워크스페이스 패키지
+    - -e packages/openpi-client
+
+    # GitHub URL 패키지
+    - git+https://github.com/huggingface/lerobot@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5#egg=lerobot
+    - git+https://github.com/kvablack/dlimp@ad72ce3a9b414db2185bc0b38461d4101a65477a#egg=dlimp
+
+    # uv의 override-dependencies 대응
+    - ml-dtypes==0.4.1
+    - tensorstore==0.1.74
+
+    # core PyPI dependencies
+    - augmax>=0.3.4
+    - dm-tree>=0.1.8
+    - einops>=0.8.0
+    - equinox>=0.11.8
+    - flatbuffers>=24.3.25
+    - flax==0.10.2
+    - fsspec[gcs]>=2024.6.0
+    - gym-aloha>=0.1.1
+    - imageio>=2.36.1
+    - jax[cuda12]==0.5.3
+    - jaxtyping==0.2.36
+    - ml_collections==1.0.0
+    - numpy>=1.22.4,<2.0.0
+    - numpydantic>=1.6.6
+    - opencv-python>=4.10.0.84
+    - openpi-client        # -e 로 이미 설치됨
+    - orbax-checkpoint==0.11.13
+    - pillow>=11.0.0
+    - sentencepiece>=0.2.0
+    - torch>=2.7.0
+    - tqdm-loggable>=0.2
+    - typing-extensions>=4.12.2
+    - tyro>=0.9.5
+    - wandb>=0.19.1
+    - filelock>=3.16.1
+    - beartype==0.19.0
+    - treescope>=0.1.7
+    - transformers==4.48.1
+    - rich>=14.0.0
+    - polars>=1.30.0
+
+    # development
+    - pytest>=8.3.4
+    - ruff>=0.8.6
+    - pre-commit>=4.0.1
+    - ipykernel>=6.29.5
+    - ipywidgets>=8.1.5
+    - matplotlib>=3.10.0
+    - pynvml>=12.0.0
+
+    # RLDS 옵션: pip 로 설치
+    - tensorflow-datasets==4.9.9
+    - tensorflow-cpu==2.15.0

@@ -18,6 +18,41 @@ import orbax.checkpoint as ocp
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
 
+def auto_fix_shape(params, expected_tree, path=None):
+    import numpy as np
+
+    if path is None:
+        path = []
+
+    if isinstance(params, dict) and isinstance(expected_tree, dict):
+        return {k: auto_fix_shape(params[k], expected_tree[k], path + [k])
+                for k in params if k in expected_tree}
+
+    # shape 비교
+    if hasattr(params, 'shape') and hasattr(expected_tree, 'shape'):
+        if params.shape != expected_tree.shape:
+            # expected가 스칼라일 때
+            if expected_tree.shape == ():
+                # JAX, numpy, torch 모두 flatten()[0] 지원
+                try:
+                    value = params.flatten()[0]
+                except Exception:
+                    # fallback: numpy array로 변환 후 flatten
+                    value = np.array(params).flatten()[0]
+                print(f"Auto-fixing {'/'.join(map(str, path))}: {params.shape} -> {expected_tree.shape} (using first value)")
+                return value
+            # expected shape에 맞게 reshape (가능한 경우)
+            try:
+                params_reshaped = np.reshape(params, expected_tree.shape)
+                print(f"Auto-fixing {'/'.join(map(str, path))}: {params.shape} -> {expected_tree.shape}")
+                return params_reshaped
+            except Exception as e:
+                print(f"Cannot auto-fix {'/'.join(map(str, path))}: {e}")
+                return params
+        return params
+
+    return params
+
 logger = logging.getLogger("openpi")
 
 ArrayT = TypeVar("ArrayT", at.Array, jax.ShapeDtypeStruct)
@@ -227,8 +262,11 @@ class BaseModelConfig(abc.ABC):
         """Create a model with the given parameters."""
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
+        ## TODO ## pi0_fql에서는 False로 설정해야함
         if remove_extra_params:
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
+        else:
+            params = auto_fix_shape(params, state.to_pure_dict())
         at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
@@ -319,3 +357,47 @@ def restore_params(
     if all(kp[-1] == "value" for kp in flat_params):
         flat_params = {kp[:-1]: v for kp, v in flat_params.items()}
     return traverse_util.unflatten_dict(flat_params)
+
+def restore_params_fql(
+    params_path: pathlib.Path | str,
+    *,
+    restore_type: type[np.ndarray] | type[jax.Array] = jax.Array,
+    dtype: jnp.dtype | None = None,
+    sharding: jax.sharding.Sharding | None = None,
+) -> dict[str, at.Params]:
+    params_path = pathlib.Path(params_path).resolve()
+    if not params_path.exists():
+        raise FileNotFoundError(f"Model params not found at: {params_path}")
+    
+    if restore_type is jax.Array and sharding is None:
+        mesh = jax.sharding.Mesh(jax.devices(), ("x",))
+        sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    with ocp.PyTreeCheckpointer() as ckptr:
+        metadata = ckptr.metadata(params_path)
+        item = {
+            "actor_params": metadata["actor_params"],
+            "critic_params": metadata["critic_params"],
+            "critic_target_params": metadata["critic_target_params"],
+        }
+
+        params = ckptr.restore(
+            params_path,
+            ocp.args.PyTreeRestore(
+                item=item,
+                restore_args=jax.tree.map(
+                    lambda _: ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=dtype), item
+                ),
+            ),
+        )
+    
+    flat_params = {}
+    for k in ["actor_params", "critic_params", "critic_target_params"]:
+        flat = traverse_util.flatten_dict(params[k])
+        if all(kp[-1] == "value" for kp in flat):
+            flat = {kp[:-1]: v for kp, v in flat.items()}
+        flat_params[k] = traverse_util.unflatten_dict(flat)
+    return flat_params
+
+# fql_params = restore_params_fql("/path/to/checkpoint_dir")
+# fql_params["actor_params"], fql_params["critic_params"], fql_params["critic_target_params"] 로 접근

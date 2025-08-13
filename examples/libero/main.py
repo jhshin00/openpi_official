@@ -14,6 +14,22 @@ from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
 
+import cv2
+def overlay_q_value_on_image(image, q_value):
+    # image: np.ndarray (H, W, 3), uint8
+    # q_value: float or np.ndarray
+    img = image.copy()
+    text = f"Q: {q_value:.3f}" if q_value is not None else "Q: N/A"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.7
+    color = (255, 255, 255)  # white
+    thickness = 2
+    # 검은색 테두리
+    cv2.putText(img, text, (10, 30), font, font_scale, (0,0,0), thickness+2, cv2.LINE_AA)
+    # 흰색 글씨
+    cv2.putText(img, text, (10, 30), font, font_scale, color, thickness, cv2.LINE_AA)
+    return img
+
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
@@ -99,6 +115,8 @@ def eval_libero(args: Args) -> None:
             # Setup
             t = 0
             replay_images = []
+            replay_q_values = []
+            q_value = None
 
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
@@ -123,6 +141,7 @@ def eval_libero(args: Args) -> None:
 
                     # Save preprocessed image for replay video
                     replay_images.append(img)
+                    replay_q_values.append(q_value)
 
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
@@ -141,7 +160,10 @@ def eval_libero(args: Args) -> None:
                         }
 
                         # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        result = client.infer(element)
+                        action_chunk = result["actions"]
+                        q_value = result.get("q_value")
+                        # action_chunk = client.infer(element)["actions"]
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
@@ -167,9 +189,13 @@ def eval_libero(args: Args) -> None:
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
+            video_frames = [
+                overlay_q_value_on_image(img, q)
+                for img, q in zip(replay_images, replay_q_values)
+            ]
             imageio.mimwrite(
                 pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
+                [np.asarray(x) for x in video_frames], # video_frames <-> replay_images
                 fps=10,
             )
 

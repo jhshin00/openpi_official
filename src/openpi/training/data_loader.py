@@ -125,6 +125,30 @@ class FakeDataset(Dataset):
     def __len__(self) -> int:
         return self._num_samples
 
+class ChunkQDataset(Dataset):
+    def __init__(self, original_dataset):
+        self._dataset = original_dataset
+
+    def __getitem__(self, index: SupportsIndex):
+        sample = self._dataset[index]
+        # Remove batch dimension from next_* fields
+        for key in list(sample.keys()):
+            if key.startswith("next_"):
+                if isinstance(sample[key], dict):
+                    # Handle nested dictionaries (like next_image)
+                    for sub_key, value in sample[key].items():
+                        if hasattr(value, 'shape') and len(value.shape) > 0:
+                            if value.shape[0] == 1:
+                                sample[key][sub_key] = value.squeeze(0)
+                else:
+                    # Handle direct arrays (like next_state)
+                    if hasattr(sample[key], 'shape') and len(sample[key].shape) > 0:
+                        if sample[key].shape[0] == 1:
+                            sample[key] = sample[key].squeeze(0)
+        return sample
+    
+    def __len__(self):
+        return len(self._dataset)
 
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
@@ -137,15 +161,50 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    if data_config.chunk_Q:
+        delta = [t / dataset_meta.fps for t in range(action_horizon)]
+        dataset = lerobot_dataset.LeRobotDataset(
+            data_config.repo_id,
+            delta_timestamps={
+                "actions": delta,
+                "reward": delta,
+                "terminal": [delta[-1]],
+                "next_state": [delta[-1]],
+                "next_image": [delta[-1]],
+                "next_wrist_image": [delta[-1]],
+            }
+        )
+        dataset = ChunkQDataset(dataset)
+    else:
+        dataset = lerobot_dataset.LeRobotDataset(
+            data_config.repo_id,
+            delta_timestamps={
+                key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+            },
+        )
+
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    # print(dataset)
+    # sample = dataset[0]
+    # print("=== DATASET STRUCTURE ===")
+    # for k, v in sample.items():
+    #     print(f"{k}: shape={getattr(v, 'shape', None)}, dtype={getattr(v, 'dtype', type(v))}")
+    # print("=========================")
+    
+    # # Check if reward_is_pad key exists
+    # print("=== KEY CHECK ===")
+    # print(f"All keys: {list(sample.keys())}")
+    # print(f"'reward_is_pad' in sample: {'reward_is_pad' in sample}")
+    # print(f"'actions_is_pad' in sample: {'actions_is_pad' in sample}")
+    # if 'reward_is_pad' in sample:
+    #     print(f"reward_is_pad shape: {sample['reward_is_pad'].shape}")
+    #     print(f"reward_is_pad dtype: {sample['reward_is_pad'].dtype}")
+    # print("==================")
+    
+    
 
     return dataset
 
@@ -485,6 +544,45 @@ class DataLoaderImpl(DataLoader):
     def data_config(self) -> _config.DataConfig:
         return self._data_config
 
+    # def __iter__(self):
+    #     for batch in self._data_loader:
+    #         yield _model.Observation.from_dict(batch), batch["actions"]
+
+    # ## iter for pi0_fql
+    # def __iter__(self):
+    #     for batch in self._data_loader:
+    #         if self._data_config.fql:
+    #             obs = _model.Observation.from_dict(batch) # 여기서 image들 다 [-1, 1] scale로
+    #             acts = batch["actions"]
+    #             rews = jnp.asarray(batch["reward"]).reshape(-1)
+    #             terminal = jnp.asarray(batch["terminal"]).reshape(-1)
+
+    #             next_dict = {k[len("next_") :]: v for k, v in batch.items() if k.startswith("next_")}
+    #             if "tokenized_prompt" in batch and "tokenized_prompt_mask" in batch:
+    #                 next_dict["tokenized_prompt"] = batch["tokenized_prompt"]
+    #                 next_dict["tokenized_prompt_mask"] = batch["tokenized_prompt_mask"]
+
+    #             next_obs = _model.Observation.from_dict(next_dict)
+
+    #             yield obs, acts, rews, terminal, next_obs
+    #         else:
+    #             yield _model.Observation.from_dict(batch), batch["actions"]
+
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            obs = _model.Observation.from_dict(batch) # 여기서 image들 다 [-1, 1] scale로
+            acts = batch["actions"]
+            rews = jnp.asarray(batch["reward"])  # Remove reshape(-1) to maintain (B, H) shape
+            terminal = jnp.asarray(batch["terminal"]).reshape(-1)  # Remove reshape(-1) to maintain (B,) shape
+
+            next_dict = {k[len("next_") :]: v for k, v in batch.items() if k.startswith("next_")}
+            if "tokenized_prompt" in batch and "tokenized_prompt_mask" in batch:
+                next_dict["tokenized_prompt"] = batch["tokenized_prompt"]
+                next_dict["tokenized_prompt_mask"] = batch["tokenized_prompt_mask"]
+
+            next_obs = _model.Observation.from_dict(next_dict)
+
+            actions_is_pad = jnp.asarray(batch["actions_is_pad"])
+            reward_is_pad = jnp.asarray(batch["reward_is_pad"])
+
+            yield obs, acts, rews, terminal, next_obs, actions_is_pad, reward_is_pad

@@ -107,6 +107,50 @@ def restore_state(
     return _merge_params(restored["train_state"], restored["params"])
 
 
+def save_state_fql(
+    checkpoint_manager: ocp.CheckpointManager,
+    state: training_utils.TrainState_AC,
+    data_loader: _data_loader.DataLoader,
+    step: int,
+):
+    def save_assets(directory: epath.Path):
+        # Save the normalization stats.
+        data_config = data_loader.data_config()
+        norm_stats = data_config.norm_stats
+        if norm_stats is not None and data_config.asset_id is not None:
+            _normalize.save(directory / data_config.asset_id, norm_stats)
+
+    # Split params that can be used for inference into a separate item.
+    with at.disable_typechecking():
+        train_state, params = _split_params_fql(state)
+    items = {
+        "assets": save_assets,
+        "train_state": train_state,
+        "params": params,
+    }
+    checkpoint_manager.save(step, items)
+
+def restore_state_fql(
+    checkpoint_manager: ocp.CheckpointManager,
+    state: training_utils.TrainState_AC,
+    data_loader: _data_loader.DataLoader,
+    step: int | None = None,
+) -> training_utils.TrainState_AC:
+    del data_loader
+
+    with at.disable_typechecking():
+        # Split params that can be used for inference into a separate item.
+        train_state, params = _split_params_fql(state)
+        restored = checkpoint_manager.restore(
+            step,
+            items={
+                "train_state": train_state,
+                "params": params,
+            },
+        )
+    return _merge_params_fql(restored["train_state"], restored["params"])
+
+
 def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:
     norm_stats_dir = epath.Path(assets_dir) / asset_id
     norm_stats = _normalize.load(norm_stats_dir)
@@ -157,3 +201,33 @@ def _merge_params(train_state: training_utils.TrainState, params: dict[str, at.P
     if train_state.params:
         return dataclasses.replace(train_state, ema_params=params["params"])
     return dataclasses.replace(train_state, params=params["params"])
+
+def _split_params_fql(state: training_utils.TrainState_AC) -> tuple[training_utils.TrainState_AC, dict[str, at.Params]]:
+    if state.ema_params is not None:
+        params = state.ema_params
+        train_state = dataclasses.replace(state, ema_params=None)
+    else:
+        params = {
+            "critic_params": state.critic_params,
+            "critic_target_params": state.critic_target_params,
+            "actor_params": state.actor_params
+        }
+        train_state = dataclasses.replace(
+            state,
+            critic_params={},
+            critic_target_params={},
+            actor_params={},
+        )
+    return train_state, params
+
+
+def _merge_params_fql(train_state: training_utils.TrainState_AC, params: dict[str, at.Params]) -> training_utils.TrainState_AC:
+    # Revert the logic inside `_split_params`. Assumes that existence of `params` means that EMA params were used during the split.
+    if train_state.actor_params:
+        return dataclasses.replace(train_state, ema_params=params["params"])
+    return dataclasses.replace(
+        train_state,
+        critic_params=params["critic_params"],
+        critic_target_params=params["critic_target_params"],
+        actor_params=params["actor_params"],
+    )

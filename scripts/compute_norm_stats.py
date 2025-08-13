@@ -98,9 +98,18 @@ def main(config_name: str, max_frames: int | None = None):
         )
 
     keys = ["state", "actions"]
+    # keys = ["state", "actions", "next_state"]
     stats = {key: normalize.RunningStats() for key in keys}
+    stats["next_state"] = normalize.RunningStats()
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+        for key in ["next_state"]:
+            values = np.asarray(batch[key][0])
+            if np.allclose(values, 0.0, atol=1e-6):
+                continue
+            else:
+                stats[key].update(values.reshape(-1, values.shape[-1]))
+
         for key in keys:
             values = np.asarray(batch[key][0])
             stats[key].update(values.reshape(-1, values.shape[-1]))

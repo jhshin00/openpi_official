@@ -115,3 +115,87 @@ class LiberoOutputs(transforms.DataTransformFn):
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
         return {"actions": np.asarray(data["actions"][:, :7])}
+
+
+@dataclasses.dataclass(frozen=True)
+class LiberoFQLInputs(transforms.DataTransformFn):
+    """
+    This class is used to convert inputs to the model to the expected format. It is used for both training and inference.
+
+    For your own dataset, you can copy this class and modify the keys based on the comments below to pipe
+    the correct elements of your dataset into the model.
+    """
+
+    # The action dimension of the model. Will be used to pad state and actions for pi0 model (not pi0-FAST).
+    # Do not change this for your own dataset.
+    action_dim: int
+
+    # Determines which model will be used.
+    # Do not change this for your own dataset.
+    model_type: _model.ModelType = _model.ModelType.PI0
+
+    def __call__(self, data: dict) -> dict:
+        mask_padding = self.model_type == _model.ModelType.PI0
+
+        state = transforms.pad_to_dim(data["observation/state"], self.action_dim)
+        # state = state[..., :7]
+
+        base_image = _parse_image(data["observation/image"])
+        wrist_image = _parse_image(data["observation/wrist_image"])
+        inputs = {
+            "state": state,
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": wrist_image,
+                # Pad any non-existent images with zero-arrays of the appropriate shape.
+                "right_wrist_0_rgb": np.zeros_like(base_image),
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                # Mask any non-existent images with False (if ``mask_padding`` is True).
+                "right_wrist_0_rgb": np.False_ if mask_padding else np.True_,
+            },
+        }
+
+        if "actions" in data:
+            # We are padding to the model action dim.
+            # For pi0-FAST, this is a no-op (since action_dim = 7).
+            actions = transforms.pad_to_dim(data["actions"], self.action_dim)
+            inputs["actions"] = actions
+
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        if "next_state" in data:
+            next_state = transforms.pad_to_dim(data["next_state"], self.action_dim)
+            # next_state = next_state[..., :7]
+            next_base_image = _parse_image(data["next_image"])
+            next_wrist_image = _parse_image(data["next_wrist_image"])
+
+            inputs["next_state"] = next_state
+            inputs["next_image"] = {
+                "base_0_rgb": next_base_image,
+                "left_wrist_0_rgb": next_wrist_image,
+                # Pad any non-existent images with zero-arrays of the appropriate shape.
+                "right_wrist_0_rgb": np.zeros_like(next_base_image),
+            }
+            inputs["next_image_mask"] = {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                # Mask any non-existent images with False (if ``mask_padding`` is True).
+                "right_wrist_0_rgb": np.False_ if mask_padding else np.True_,
+            }
+        if "reward" in data:
+            inputs["reward"] = data["reward"]
+        
+        if "terminal" in data:
+            inputs["terminal"] = data["terminal"]
+
+        if "actions_is_pad" in data:
+            inputs["actions_is_pad"] = data["actions_is_pad"]
+        
+        if "reward_is_pad" in data:
+            inputs["reward_is_pad"] = data["reward_is_pad"]
+
+        return inputs

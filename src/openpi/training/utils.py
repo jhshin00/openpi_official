@@ -22,6 +22,40 @@ class TrainState:
     ema_decay: float | None = struct.field(pytree_node=False)
     ema_params: nnx.State | None = None
 
+@at.typecheck
+@struct.dataclass
+class TrainState_AC:
+    step: at.Int[at.ArrayLike, ""]
+    critic_params: nnx.State
+    critic_target_params: nnx.State
+    actor_params: nnx.State
+    model_def: nnx.GraphDef[_model.BaseModel]
+    critic_opt_state: optax.OptState
+    actor_opt_state: optax.OptState
+    tx_critic: optax.GradientTransformation = struct.field(pytree_node=False)
+    tx_actor: optax.GradientTransformation = struct.field(pytree_node=False)
+
+    ema_decay: float | None = struct.field(pytree_node=False)
+    ema_params: nnx.State | None = None
+
+@at.typecheck
+@struct.dataclass
+class TrainState_AC_test:
+    step: at.Int[at.ArrayLike, ""]
+    critic_params: nnx.State
+    critic_target_params: nnx.State
+    actor_params: nnx.State
+    model_def: nnx.GraphDef[_model.BaseModel]
+    critic_opt_state: optax.OptState
+    critic_target_opt_state: optax.OptState
+    actor_opt_state: optax.OptState
+    tx_critic: optax.GradientTransformation = struct.field(pytree_node=False)
+    tx_critic_target: optax.GradientTransformation = struct.field(pytree_node=False)
+    tx_actor: optax.GradientTransformation = struct.field(pytree_node=False)
+
+    ema_decay: float | None = struct.field(pytree_node=False)
+    ema_params: nnx.State | None = None
+
 
 @at.typecheck
 def tree_to_info(tree: at.PyTree, interp_func: Callable[[Any], str] = str) -> str:
