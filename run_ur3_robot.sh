@@ -1,53 +1,82 @@
 #!/bin/bash
 set -euo pipefail
 
-# UR3 Robot Control Script
-# 실제 로봇에서 policy를 실행하기 위한 script
-
-export CUDA_VISIBLE_DEVICES=2,3
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+# ===== GPU 및 환경 설정 =====
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3}
+export XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.9}
 export HF_LEROBOT_HOME=./datasets
 export HF_DATASETS_CACHE=$(pwd)/datasets/cache
 export HUGGINGFACE_HUB_CACHE=$(pwd)/datasets/cache/hub
 
-echo "🤖 UR3 Robot Control Script"
+# ===== Policy Server 설정 =====
+export POLICY_HOST=${POLICY_HOST:-localhost}
+export POLICY_PORT=${POLICY_PORT:-8000}
+export API_KEY=${API_KEY:-}
+
+# ===== Task 설정 =====
+export TASK_PROMPT=${TASK_PROMPT:-"pick up the green grape and put it in the gray pot"}
+
+# ===== Robot 설정 =====
+export ROBOT_PORT=${ROBOT_PORT:-6001}
+export WRIST_CAMERA_PORT=${WRIST_CAMERA_PORT:-5000}
+export BASE_CAMERA_PORT=${BASE_CAMERA_PORT:-5001}
+export HOSTNAME=${HOSTNAME:-127.0.0.1}
+export HZ=${HZ:-40}
+
+# ===== Agent 설정 =====
+export AGENT=${AGENT:-policy}
+export GELLO_PORT=${GELLO_PORT:-}
+export START_JOINTS=${START_JOINTS:-}
+
+# ===== Camera 설정 =====
+export CAMERA_WIDTH=${CAMERA_WIDTH:-640}
+export CAMERA_HEIGHT=${CAMERA_HEIGHT:-480}
+export CAMERA_FPS=${CAMERA_FPS:-30}
+
+# ===== Control 설정 =====
+export MAX_JOINT_DELTA=${MAX_JOINT_DELTA:-0.8}
+export OPEN_LOOP_HORIZON=${OPEN_LOOP_HORIZON:-5}
+
+# ===== Data Saving 설정 =====
+export USE_SAVE_INTERFACE=${USE_SAVE_INTERFACE:-true}
+export DATA_DIR=${DATA_DIR:-~/ur3_data}
+
+# ===== Mock Mode 설정 =====
+export MOCK=${MOCK:-false}
+
+echo "🚀 UR3 Robot Control Script"
 echo "=========================="
-echo "⚠️  WARNING: This will control a real robot!"
-echo "⚠️  Make sure the robot is in a safe position and area is clear"
-echo "⚠️  Press Ctrl+C to stop the robot safely"
+echo "Policy Server: ${POLICY_HOST}:${POLICY_PORT}"
+echo "Task: ${TASK_PROMPT}"
+echo "Agent: ${AGENT}"
+echo "Robot Port: ${ROBOT_PORT}"
+echo "Camera: ${CAMERA_WIDTH}x${CAMERA_HEIGHT} @ ${CAMERA_FPS}fps"
+echo "Control Hz: ${HZ}"
+echo "Mock Mode: ${MOCK}"
 echo "=========================="
 
-# 사용자 확인
-read -p "Are you sure you want to continue? (y/N): " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "❌ Robot control cancelled"
-    exit 1
-fi
+# ===== main.py 실행 =====
+echo "Starting main.py..."
+python main.py \
+    --policy-host "${POLICY_HOST}" \
+    --policy-port "${POLICY_PORT}" \
+    --api-key "${API_KEY}" \
+    --task-prompt "${TASK_PROMPT}" \
+    --robot-port "${ROBOT_PORT}" \
+    --wrist-camera-port "${WRIST_CAMERA_PORT}" \
+    --base-camera-port "${BASE_CAMERA_PORT}" \
+    --hostname "${HOSTNAME}" \
+    --hz "${HZ}" \
+    --agent "${AGENT}" \
+    --gello-port "${GELLO_PORT}" \
+    --start-joints "${START_JOINTS}" \
+    --camera-width "${CAMERA_WIDTH}" \
+    --camera-height "${CAMERA_HEIGHT}" \
+    --camera-fps "${CAMERA_FPS}" \
+    --max-joint-delta "${MAX_JOINT_DELTA}" \
+    --open-loop-horizon "${OPEN_LOOP_HORIZON}" \
+    --use-save-interface "${USE_SAVE_INTERFACE}" \
+    --data-dir "${DATA_DIR}" \
+    --mock "${MOCK}"
 
-# 추가 안전 확인
-read -p "Is the robot workspace clear of obstacles and people? (y/N): " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "❌ Safety check failed - robot control cancelled"
-    exit 1
-fi
-
-echo "✅ Safety checks passed - starting robot control..."
-
-# 가상환경 활성화 및 로봇 제어 실행
-source .venv/bin/activate
-
-# 로봇 제어 실행
-python run_ur3_robot.py \
-  --host localhost \
-  --port 8000 \
-  --robot_ip "192.168.1.100" \
-  --control_freq 10.0 \
-  --base_camera_id 0 \
-  --wrist_camera_id 1 \
-  --task_prompt "pick up the green grape and put it in the gray pot" \
-  --max_joint_velocity 0.5 \
-  --max_joint_acceleration 1.0 \
-  --action_horizon 8 \
-  --safety_check true 
+echo "✅ UR3 Robot Control finished"
