@@ -37,7 +37,7 @@ import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
-from expo_pi0.train.expo_buffer import TrajReplayBuffer
+from openpi.training.expo_buffer import TrajReplayBuffer
 from openpi.training.expo_train_utils import (
     get_libero_env,
     collect_trajectory,
@@ -427,6 +427,12 @@ def main(config: _config.TrainConfig):
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[config.libero_task_suite]()
     num_tasks = task_suite.get_num_tasks()
+    logging.info(f"Task suite: {config.libero_task_suite}, Number of tasks: {num_tasks}")
+    
+    # 모든 task들의 description을 출력
+    for i in range(num_tasks):
+        task = task_suite.get_task(i)
+        logging.info(f"Task {i}: {task.language}")
 
     
     env = None
@@ -494,9 +500,11 @@ def main(config: _config.TrainConfig):
         if step >= config.offline_steps:
             if step % config.rollout_interval == 0:
                 if step % (config.env_reuse_frequency*config.rollout_interval) == 0 or env is None:
-                    task_id = np.random.randint(0, num_tasks)
+                    traj_rng, task_rng = jax.random.split(traj_rng)
+                    task_id = jax.random.randint(task_rng, (), 0, num_tasks)
                     task = task_suite.get_task(task_id)
                     env, task_description = get_libero_env(task, 256, config.seed)
+                    logging.info(f"Online data collection at step {step}: task_id={task_id}, task_description='{task_description}'")
                     # eval_env = env
 
                 traj_rng = jax.random.fold_in(traj_rng, step)
@@ -537,10 +545,11 @@ def main(config: _config.TrainConfig):
             
         if step % config.eval_interval == 0:
             eval_rng = jax.random.fold_in(eval_rng, step)
-            # if eval_env is None:
-            task_id = np.random.randint(0, num_tasks)
+            eval_rng, task_rng = jax.random.split(eval_rng)
+            task_id = jax.random.randint(task_rng, (), 0, num_tasks)
             task = task_suite.get_task(task_id)
             eval_env, task_description = get_libero_env(task, 256, config.seed)
+            logging.info(f"Eval at step {step}: task_id={task_id}, task_description='{task_description}'")
 
             perform_control_eval(eval_rng, config, train_state, eval_env, task_description, step, tokenizer)
 
