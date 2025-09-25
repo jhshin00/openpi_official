@@ -23,6 +23,32 @@ class TrainState:
     ema_params: nnx.State | None = None
 
 
+
+@at.typecheck
+@struct.dataclass
+class TrainStatePi0Expo:
+    step: at.Int[at.ArrayLike, ""]
+    
+    critic_params: nnx.State
+    target_critic_params: nnx.State
+    actor_params: nnx.State
+    edit_actor_params: nnx.State
+    temp_params: nnx.State
+    
+    model_def: nnx.GraphDef[_model.BaseModel]
+    critic_opt_state: optax.OptState
+    actor_opt_state: optax.OptState
+    edit_actor_opt_state: optax.OptState
+    temp_opt_state: optax.OptState
+    
+    tx_critic: optax.GradientTransformation = struct.field(pytree_node=False)
+    tx_actor: optax.GradientTransformation = struct.field(pytree_node=False)
+    tx_edit_actor: optax.GradientTransformation = struct.field(pytree_node=False)
+    tx_temp: optax.GradientTransformation = struct.field(pytree_node=False)
+
+
+
+
 @at.typecheck
 def tree_to_info(tree: at.PyTree, interp_func: Callable[[Any], str] = str) -> str:
     """Converts a PyTree into a human-readable string for logging. Optionally, `interp_func` can be provided to convert

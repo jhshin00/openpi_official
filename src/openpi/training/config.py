@@ -753,6 +753,54 @@ _CONFIGS = [
     # RoboArena configs.
     #
     *roboarena_config.get_roboarena_configs(),
+
+    TrainConfig(
+        name="pi0_expo_libero",
+        project_name="pi0_expo",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0.Pi0ExpoConfig(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+            encoder_sharing=False,
+            img_latent_dim=256,
+            txt_latent_dim=256,
+            state_dim=128,
+            hidden_dim=256,
+            out_dim=256,
+            vocab_size=257_152,
+            image_keys=["base_0_rgb", "left_wrist_0_rgb"],
+            d_model=256,
+            n_layers=2,
+            kernel_size=3,
+            dropout_rate=0.1,
+            use_layer_norm=True,
+            use_film_gate=True,
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=48,
+            discount=0.99,
+            n_base_samples=2,
+            n_edit_samples=4,
+            entropy_scale=1.0,
+            target_entropy=-16.0,
+            edit_action_scale=0.05,
+            initial_temperature=1.0,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0.Pi0ExpoConfig(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
