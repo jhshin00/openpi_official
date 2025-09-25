@@ -447,7 +447,7 @@ class Pi0Expo(_model.BaseModel):
         observation: _model.Observation,
         actions: _model.Actions,
         *,
-        train: bool = False
+        train: bool = False,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
@@ -483,11 +483,12 @@ class Pi0Expo(_model.BaseModel):
         next_observation: _model.Observation,
         masks: at.Bool[at.Array, "b"],
         *,
-        train: bool = False
+        train: bool = False,
+        retrieval_actions: _model.Actions = None,
     ) -> at.Float[at.Array, ""]:
 
         rng, rng_sample, rng_obs1, rng_obs2 = jax.random.split(rng, 4)
-        next_actions = self.sample_OTF_actions(rng_sample, next_observation)
+        next_actions = self.sample_OTF_actions(rng_sample, next_observation, retrieval_actions=retrieval_actions)
 
         gamma_vec = jnp.power(self.discount, jnp.arange(self.action_horizon))[None, :]
         G_n = jnp.sum(gamma_vec * rewards, axis=1)
@@ -516,7 +517,8 @@ class Pi0Expo(_model.BaseModel):
         observation: _model.Observation,
         actions: _model.Actions,
         *,
-        train: bool = False
+        train: bool = False,
+        retrieval_actions: _model.Actions = None,
     ) -> tuple[at.Float[at.Array, ""], at.Float[at.Array, ""]]:
 
         rng, rng_obs = jax.random.split(rng)
@@ -524,7 +526,7 @@ class Pi0Expo(_model.BaseModel):
 
         # Sample actions from edit_actor
         edit_actions, log_probs = self.edit_actor.sample_actions(
-            rng, observation, actions, return_logp=True, train=train
+            rng, observation, actions, return_logp=True, train=train, retrieval_actions=retrieval_actions
         )
         
         # Scale actions and adjust log probabilities
@@ -623,6 +625,7 @@ class Pi0Expo(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         train: bool = False,
+        retrieved_actions : _model.Actions = None,
     ) -> _model.Actions:
         # [consts]
         H = self.action_horizon
@@ -660,6 +663,9 @@ class Pi0Expo(_model.BaseModel):
         
         else:
             action_candidates = base_samples # [B,N,H,A]
+
+        if retrieved_actions is not None:
+            action_candidates = jnp.concatenate([action_candidates, retrieved_actions], axis=1) # [B,M,H,A], M=N+n+K
 
         def eval_one(obs_b, acts_bm):
             return jax.vmap(

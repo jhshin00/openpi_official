@@ -33,6 +33,23 @@ ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
 
+@dataclass
+class BufferConfig:
+    capacity_total: int = 100_000         # 총 step 수 기준
+    batch_offline_ratio: float = 0.5      # 배치 내 offline:online 비율
+    success_memory_per_task: int = 10     # 성공 메모리 크기
+    eviction: str = "fifo"                # online eviction 정책
+
+@dataclass
+class RetrievalConfig:
+    enabled: bool = True
+    topk: int = 8                         # 한 배치당 후보 traj/action 묶음 개수
+    success_only: bool = True             # 성공 traj만 인덱싱
+    alpha_q: float = 0.3                  # Q 혼합 가중 등(너의 SimpleRetriever 정의에 맞춤)
+    refresh_every: int = 2000             # 스텝 단위 인덱스 리프레시
+    use_for_targets: bool = True          # critic target(next action)에도 사용
+    use_for_rollout: bool = True          # 환경 상호작용 시에도 사용
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -126,6 +143,9 @@ class TrainConfig:
     env_max_reward: float = 1.0  # Maximum reward in environment
     num_steps_wait: int = 0  # Steps to wait before starting action
     rollout_interval: int = 100  # Rollout interval
+
+    buffer: BufferConfig = BufferConfig()
+    retrieval: RetrievalConfig = RetrievalConfig()
 
 
     @property

@@ -1,141 +1,66 @@
 """
-EXPO Replay Buffer with Libero Offline Data Support
-==================================================
+EXPO Replay Buffer with Libero Offline Data Support (Two-tier, Retrieval-ready)
+==============================================================================
 
-This module provides a trajectory-based replay buffer that can optionally preload
-offline demonstration data from the LIBERO-90 dataset for robot manipulation tasks.
-
-Key Features:
-- Trajectory-based storage and sampling
-- Automatic loading of LIBERO-90 offline data
-- Support for multi-modal observations (RGB images, robot states)
-- Efficient trajectory removal when buffer capacity is exceeded
-
-LIBERO-90 Dataset:
-- 90 different manipulation tasks across 3 scenes (Kitchen, Living Room, Study)
-- ~4500 demonstration trajectories total
-- Multi-modal observations: RGB images + robot proprioception
-- Sparse reward structure (1 at goal completion, 0 otherwise)
-
-Data Format:
-- HDF5 files with nested structure: data/demo_N/{actions, rewards, dones, obs/...}
-- Observations include: agentview_rgb (256x256), eye_in_hand_rgb (256x256), ee_pos, ee_ori, joint_states, etc.
-- Actions: 7D vector [x, y, z, qx, qy, qz, qw, gripper]
-- Rewards: Sparse binary rewards (1 at task completion)
-- Masks: Continuation flags (1 - dones)
+- Two-tier pools: OFFLINE (pinned, never evicted) + ONLINE (evicted first)
+- Success memory per task (for retrieval indexing)
+- Stratified sampling (offline:online) per batch
+- Vectorized LIBERO HDF5 -> expo_pi0 trajectory loader (optional)
+- No dependency on self.trajectories (removed); pooled storage only
 
 Usage:
-    buffer = TrajReplayBuffer(obs_space, action_space, capacity, use_offline_data=True)
-    # Automatically loads all LIBERO-90 trajectories
-    batch = buffer.sample(batch_size=256)  # Sample random steps
-    trajs = buffer.get_random_trajs(num_trajs=32)  # Sample random trajectories
+    buffer = TrajReplayBuffer(obs_space, action_space, capacity,
+                              use_offline_data=True,
+                              libero_data_dir="/ssd2/EXPO/datasets/libero_90",
+                              offline_dataset_subset_num=300)
+    batch = buffer.sample(batch_size=256)  # returns (obs, actions, rewards, next_obs, masks)
+    for batch in buffer.get_iterator(batch_size=256): ...
+
+Notes:
+- capacity is measured in *steps* (sum of episode_length across all trajectories)
+- OFFLINE pool is pinned (never evicted). If capacity is exceeded, ONLINE is evicted first.
 """
 
-from typing import Union
-from typing import Iterable, Optional
-import jax 
-import jax.numpy as jnp
+from __future__ import annotations
+
+from typing import Iterable, Optional, Dict, Any, List, Tuple
+import os
+import re
+import copy
+import pickle
+import collections
+from collections import deque, defaultdict
+
+import numpy as np
 import gym
 import gym.spaces
-import numpy as np
-import pickle
-
-import copy
-import os
+import jax
+import jax.numpy as jnp
 import h5py
 
-import collections
 from openpi.data.dataset import Dataset, DatasetDict
-
-# Import required modules for expo_pi0 format conversion
-from openpi.transforms import TokenizePrompt
+from openpi.training.expo_train_utils import pad_to_dim
 from openpi.models import model as _model
 from openpi.models import tokenizer as _tokenizer
+from openpi.transforms import TokenizePrompt
 from openpi_client import image_tools
 
-# Import helper functions from train_utils
-from openpi.training.expo_train_utils import pad_to_dim
 
-def _init_replay_dict(
-    obs_space: gym.Space,
-    capacity: int) -> Union[np.ndarray, DatasetDict]:
-    if isinstance(obs_space, gym.spaces.Box):
-        return np.empty((capacity, *obs_space.shape), dtype=obs_space.dtype)
-    elif isinstance(obs_space, gym.spaces.Dict):
-        data_dict = {}
-        for k, v in obs_space.spaces.items():
-            data_dict[k] = _init_replay_dict(v, capacity)
-        return data_dict
-    else:
-        raise TypeError()
+# ------------------------------
+# Helpers for LIBERO conversion
+# ------------------------------
 
-
-def _insert_recursively(
-    buffer_data: Union[np.ndarray, dict], 
-    input_data: Union[np.ndarray, dict], 
-    insert_index: int
-):
-    """Recursively insert data into buffer structure."""
-    if isinstance(buffer_data, np.ndarray) and isinstance(input_data, np.ndarray):
-        # Both are numpy arrays - direct assignment
-        buffer_data[insert_index] = input_data
-    elif (hasattr(buffer_data, 'items') and hasattr(buffer_data, 'keys') and 
-          hasattr(input_data, 'items') and hasattr(input_data, 'keys')):
-        # Both are dictionary-like objects - recurse into subkeys
-        for key in input_data:
-            if key in buffer_data:
-                _insert_recursively(buffer_data[key], input_data[key], insert_index)
-    else:
-        # Type mismatch - direct assignment (for non-array types)
-        if isinstance(buffer_data, np.ndarray):
-            buffer_data[insert_index] = input_data
-        else:
-            raise TypeError(f"Cannot insert {type(input_data)} into {type(buffer_data)}")
-
-
-def _sample_recursively(
-    buffer_data: Union[np.ndarray, dict], 
-    indices: np.ndarray
-) -> Union[np.ndarray, dict]:
-    """Recursively sample data from buffer structure."""
-    if isinstance(buffer_data, np.ndarray):
-        # Numpy array - sample by indices
-        return buffer_data[indices]
-    elif hasattr(buffer_data, 'items') and hasattr(buffer_data, 'keys'):
-        # Dictionary-like object - recurse into subkeys
-        result = {}
-        for key, value in buffer_data.items():
-            result[key] = _sample_recursively(value, indices)
-        return result
-    else:
-        # Non-array type - return as is
-        return buffer_data
-
-
-def libero_obs_to_expo_pi0_format(libero_obs, task_description, max_token_len=48, action_dim=32):
-    """
-    Convert libero observation format to expo_pi0 format.
-    
-    Args:
-        libero_obs: Dictionary with libero observation keys
-        task_description: Task description string
-        max_token_len: Maximum token length for prompt
-    
-    Returns:
-        Dictionary in expo_pi0 format
-    """
-    # Convert images from libero format to expo_pi0 format
+def libero_obs_to_expo_pi0_format(libero_obs: Dict[str, np.ndarray],
+                                  task_description: str,
+                                  max_token_len: int = 48,
+                                  action_dim: int = 32) -> Dict[str, Any]:
+    """Convert a single step (dict) of libreo obs → expo_pi0 obs (batched length=1)."""
     base_img = np.ascontiguousarray(libero_obs["agentview_rgb"][::-1, ::-1])
     wrist_img = np.ascontiguousarray(libero_obs["eye_in_hand_rgb"][::-1, ::-1])
-    
-    # Resize to 224x224 (expo_pi0 format)
-    base_img = image_tools.convert_to_uint8(
-        image_tools.resize_with_pad(base_img, 224, 224)
-    )
-    wrist_img = image_tools.convert_to_uint8(
-        image_tools.resize_with_pad(wrist_img, 224, 224)
-    )
-    
+
+    base_img = image_tools.convert_to_uint8(image_tools.resize_with_pad(base_img, 224, 224))
+    wrist_img = image_tools.convert_to_uint8(image_tools.resize_with_pad(wrist_img, 224, 224))
+
     images = {
         "base_0_rgb": base_img[None, ...],
         "left_wrist_0_rgb": wrist_img[None, ...],
@@ -147,701 +72,541 @@ def libero_obs_to_expo_pi0_format(libero_obs, task_description, max_token_len=48
         "right_wrist_0_rgb": np.array([False]),
     }
 
-    # Convert state from libero format to expo_pi0 format
-    # libero: ee_pos (3) + ee_ori (3) + gripper_states (2)
-    # expo_pi0: ee_pos (3) + ee_ori (3) + gripper_states (1) - remove last gripper dim
     state = np.concatenate([
-        libero_obs["ee_pos"],  # (3,)
-        libero_obs["ee_ori"],  # (3,) - already in axis-angle format
-        libero_obs["gripper_states"][:1]  # (1,) - take only first gripper joint
+        libero_obs["ee_pos"],              # (3,)
+        libero_obs["ee_ori"],              # (3,)
+        libero_obs["gripper_states"][:1],  # (1,)
     ])[None, ...].astype(np.float32)
-
     state = pad_to_dim(state, action_dim, axis=-1)
-    
-    # Tokenize prompt
-    prompt = str(task_description)
+
     tokenizer = _tokenizer.PaligemmaTokenizer(max_token_len)
     obs_dict = TokenizePrompt(tokenizer)({
         "image": images,
         "image_mask": image_masks,
         "state": state,
-        "prompt": prompt,
+        "prompt": str(task_description),
     })
     obs_dict["tokenized_prompt"] = obs_dict["tokenized_prompt"][None, ...]
     obs_dict["tokenized_prompt_mask"] = obs_dict["tokenized_prompt_mask"][None, ...]
-    
     return obs_dict
 
 
-def load_libero_trajectory(hdf5_path: str, demo_idx: int = 0, task_description: str = "manipulation task", max_token_len: int = 48, action_dim: int = 32) -> DatasetDict:
+def load_libero_trajectory(hdf5_path: str,
+                           demo_idx: int = 0,
+                           task_description: str = "manipulation task",
+                           max_token_len: int = 48,
+                           action_dim: int = 32) -> DatasetDict:
     """
-    Load a single trajectory from libero HDF5 file and convert to expected format.
-    
-    Libero HDF5 Data Structure:
-    ==========================
-    HDF5 File Structure:
-    - data/
-      - demo_0/
-        - actions: (T, 7) - Robot actions [x, y, z, qx, qy, qz, qw, gripper]
-        - rewards: (T,) - Reward values (usually sparse, 1 at goal, 0 otherwise)
-        - dones: (T,) - Episode termination flags (1 at episode end, 0 otherwise)
-        - obs/
-          - agentview_rgb: (T, 256, 256, 3) - Third-person camera RGB images
-          - eye_in_hand_rgb: (T, 256, 256, 3) - Wrist-mounted camera RGB images
-          - ee_pos: (T, 3) - End-effector position [x, y, z]
-          - ee_ori: (T, 3) - End-effector orientation [rx, ry, rz] (euler angles)
-          - ee_states: (T, 6) - Combined end-effector state [pos + ori]
-          - gripper_states: (T, 2) - Gripper joint positions
-          - joint_states: (T, 7) - Robot joint positions
-        - robot_states: (T, ...) - Additional robot state information
-        - states: (T, ...) - Environment state information
-      - demo_1/
-        - ... (same structure as demo_0)
-      - ...
-      - demo_N/
-        - ... (same structure as demo_0)
-    
-    Converted Trajectory Format (for insert_traj):
-    =============================================
-    {
-        'episode_length': int,  # Number of timesteps in trajectory
-        'observations': {
-            'image': {
-                'base_0_rgb': list,         # List of (1, 224, 224, 3) arrays
-                'left_wrist_0_rgb': list,   # List of (1, 224, 224, 3) arrays  
-                'right_wrist_0_rgb': list,  # List of (1, 224, 224, 3) arrays
-            },
-            'image_mask': {
-                'base_0_rgb': list,         # List of (1,) boolean arrays
-                'left_wrist_0_rgb': list,   # List of (1,) boolean arrays
-                'right_wrist_0_rgb': list,  # List of (1,) boolean arrays
-            },
-            'state': list,                  # List of (1, 7) arrays [ee_pos(3) + ee_ori(3) + gripper(2)]
-            'tokenized_prompt': list,       # List of (1, max_token_len) arrays
-            'tokenized_prompt_mask': list,  # List of (1, max_token_len) boolean arrays
-        },
-        'actions': np.ndarray,     # (T, 7) - Robot actions
-        'rewards': np.ndarray,     # (T,) - Reward values
-        'masks': np.ndarray,       # (T,) - Continuation masks (1 - dones)
-    }
-    
-    Args:
-        hdf5_path: Path to the HDF5 file
-        demo_idx: Index of the demonstration to load (default: 0)
-    
-    Returns:
-        DatasetDict in the format expected by insert_traj
+    Load one LIBERO demo (vectorized) → flat trajectory dict compatible with insert_traj.
     """
     with h5py.File(hdf5_path, 'r') as f:
         demo = f['data'][f'demo_{demo_idx}']
-        
-        # Extract data
-        actions = demo['actions'][:]  # (T, 7)
-        rewards = demo['rewards'][:]  # (T,)
-        dones = demo['dones'][:]  # (T,)
+        actions = demo['actions'][:]                  # (T, 7)
+        rewards = demo['rewards'][:]                  # (T,)
+        dones = demo['dones'][:]                      # (T,)
         obs_group = demo['obs']
-        
-        # Extract observations in libero format
-        libero_observations = {}
-        for key in obs_group.keys():
-            libero_observations[key] = obs_group[key][:]  # (T, ...)
-        
-        # Convert to expo_pi0 format - fully vectorized processing for maximum efficiency
-        base_imgs = libero_observations["agentview_rgb"]  # (T, 256, 256, 3)
-        wrist_imgs = libero_observations["eye_in_hand_rgb"]  # (T, 256, 256, 3)
-        
-        # Vectorized image processing - flip and resize all at once
-        # Flip images: [::-1, ::-1] for both height and width
-        base_imgs_flipped = base_imgs[:, ::-1, ::-1, :]  # (T, 256, 256, 3)
-        wrist_imgs_flipped = wrist_imgs[:, ::-1, ::-1, :]  # (T, 256, 256, 3)
-        
-        # Process all images at once using existing image_tools (supports batch processing!)
-        # image_tools.resize_with_pad already handles batch dimension via reshape(-1, ...)
+
+        lib_obs = {k: obs_group[k][:] for k in obs_group.keys()}
+        base_imgs = lib_obs["agentview_rgb"]          # (T, 256, 256, 3)
+        wrist_imgs = lib_obs["eye_in_hand_rgb"]       # (T, 256, 256, 3)
+
+        base_imgs_flipped = base_imgs[:, ::-1, ::-1, :]
+        wrist_imgs_flipped = wrist_imgs[:, ::-1, ::-1, :]
+
         processed_base_imgs = image_tools.convert_to_uint8(
             image_tools.resize_with_pad(base_imgs_flipped, 224, 224)
-        )  # (T, 224, 224, 3)
-        
+        )
         processed_wrist_imgs = image_tools.convert_to_uint8(
             image_tools.resize_with_pad(wrist_imgs_flipped, 224, 224)
-        )  # (T, 224, 224, 3)
-        
-        # Create images dictionary
+        )
+
         images = {
-            "base_0_rgb": processed_base_imgs,
-            "left_wrist_0_rgb": processed_wrist_imgs,
+            "base_0_rgb": processed_base_imgs,                    # (T, 224, 224, 3)
+            "left_wrist_0_rgb": processed_wrist_imgs,             # (T, 224, 224, 3)
             "right_wrist_0_rgb": np.zeros_like(processed_base_imgs),
         }
         image_masks = {
-            "base_0_rgb": np.ones(len(actions), dtype=bool),
+            "base_0_rgb": np.ones(len(actions), dtype=bool),      # (T,)
             "left_wrist_0_rgb": np.ones(len(actions), dtype=bool),
             "right_wrist_0_rgb": np.zeros(len(actions), dtype=bool),
         }
-        
-        # Convert state from libero format to expo_pi0 format
-        # libero: ee_pos (3) + ee_ori (3) + gripper_states (2)
-        # expo_pi0: ee_pos (3) + ee_ori (3) + gripper_states (1) - remove last gripper dim
-        state = np.concatenate([
-            libero_observations["ee_pos"],  # (T, 3)
-            libero_observations["ee_ori"],  # (T, 3) - already in axis-angle format
-            libero_observations["gripper_states"][:, :1]  # (T, 1) - take only first gripper joint
-        ], axis=1).astype(np.float32)  # (T, 7)
 
+        state = np.concatenate([
+            lib_obs["ee_pos"],                    # (T,3)
+            lib_obs["ee_ori"],                    # (T,3)
+            lib_obs["gripper_states"][:, :1],     # (T,1)
+        ], axis=1).astype(np.float32)             # (T,7)
         state = pad_to_dim(state, action_dim, axis=-1)
-        
-        # Tokenize prompt once for the entire trajectory
-        prompt = str(task_description)
+
         tokenizer = _tokenizer.PaligemmaTokenizer(max_token_len)
-        
-        # Tokenize once - TokenizePrompt only needs prompt
-        tokenized = TokenizePrompt(tokenizer)({"prompt": prompt})
-        tokenized_prompt = tokenized["tokenized_prompt"]  # (1, max_token_len)
-        tokenized_prompt_mask = tokenized["tokenized_prompt_mask"]  # (1, max_token_len)
-        
-        # Repeat for all timesteps
-        tokenized_prompts = np.tile(tokenized_prompt, (len(actions), 1))  # (T, max_token_len)
-        tokenized_prompt_masks = np.tile(tokenized_prompt_mask, (len(actions), 1))  # (T, max_token_len)
-        
-        # Create final observation structure
-        expo_observations = {
-            "image": images,
-            "image_mask": image_masks,
-            "state": state,
-            "tokenized_prompt": tokenized_prompts,
-            "tokenized_prompt_mask": tokenized_prompt_masks,
-        }
-        
-        # Convert dones to masks (masks = 1 - dones)
+        tokenized = TokenizePrompt(tokenizer)({"prompt": str(task_description)})
+        tok = tokenized["tokenized_prompt"]                # (1,L)
+        tok_m = tokenized["tokenized_prompt_mask"]         # (1,L)
+        tokenized_prompts = np.tile(tok,   (len(actions), 1))
+        tokenized_masks   = np.tile(tok_m, (len(actions), 1))
+
         masks = (1 - dones).astype(np.bool_)
-        
-        # Create flat trajectory structure directly (no need for helper function)
-        is_success = (rewards[-1] == 1.0)  # Assume success if last reward is 1
-        episode_length = len(actions)
-        env_steps = len(actions)
-        
-        # Print trajectory info
+        is_success = bool(rewards[-1] == 1.0)
+        episode_length = int(len(actions))
+        env_steps = episode_length
+
         print(f"  Loaded trajectory: {task_description}")
         print(f"    - Episode length: {episode_length}")
         print(f"    - Success: {is_success}")
-        print(f"    - Episode return: {rewards.sum()}")
-        print(f"    - Action range: [{actions.min():.3f}, {actions.max():.3f}]")
-        
-        # Create flat trajectory structure directly
+        print(f"    - Episode return: {rewards.sum():.1f}")
+
         traj = {
-            'base_img': expo_observations['image']['base_0_rgb'],  # (T, 224, 224, 3)
-            'wrist_img': expo_observations['image']['left_wrist_0_rgb'],  # (T, 224, 224, 3)
-            'base_img_mask': expo_observations['image_mask']['base_0_rgb'],  # (T,)
-            'wrist_img_mask': expo_observations['image_mask']['left_wrist_0_rgb'],  # (T,)
-            'state': expo_observations['state'],  # (T, 7)
-            'tokenized_prompt': expo_observations['tokenized_prompt'],  # (T, max_token_len)
-            'tokenized_prompt_mask': expo_observations['tokenized_prompt_mask'],  # (T, max_token_len)
-            'actions': actions,  # (T, 7)
-            'rewards': rewards,  # (T,)
-            'masks': masks,  # (T,)
+            'task_name': task_description,
+            'base_img': images['base_0_rgb'],                       # (T, 224, 224, 3)
+            'wrist_img': images['left_wrist_0_rgb'],                # (T, 224, 224, 3)
+            'base_img_mask': image_masks['base_0_rgb'],             # (T,)
+            'wrist_img_mask': image_masks['left_wrist_0_rgb'],      # (T,)
+            'state': state,                                         # (T, action_dim>=7)
+            'tokenized_prompt': tokenized_prompts,                  # (T, L)
+            'tokenized_prompt_mask': tokenized_masks,               # (T, L)
+            'actions': actions,                                     # (T, 7)
+            'rewards': rewards,                                     # (T,)
+            'masks': masks,                                         # (T,)
             'is_success': is_success,
-            'episode_return': rewards.sum(),
+            'episode_return': float(rewards.sum()),
             'episode_length': episode_length,
-            'env_steps': env_steps
+            'env_steps': env_steps,
         }
-        
         return traj
 
 
-def load_sample_libero_trajectories(dataset_dir: str, max_trajectories: int = None, max_token_len: int = 48, action_dim: int = 32) -> list:
-    """
-    Load a sample of trajectories from libero_90 dataset.
-    
-    Args:
-        dataset_dir: Path to the libero_90 dataset directory
-        max_trajectories: Maximum number of trajectories to load (None for all)
-        max_token_len: Maximum token length for prompt tokenization
-    
-    Returns:
-        List of trajectory dictionaries, each in the format expected by insert_traj
-    """
-    trajectories = []
-    
-    # Get all HDF5 files in the directory
-    hdf5_files = [f for f in os.listdir(dataset_dir) if f.endswith('.hdf5')]
-    hdf5_files.sort()  # Sort for consistent ordering
-    
+def load_sample_libero_trajectories(dataset_dir: str,
+                                    max_trajectories: Optional[int] = None,
+                                    max_token_len: int = 48,
+                                    action_dim: int = 32) -> List[DatasetDict]:
+    """Load a subset of LIBERO trajectories from directory of *.hdf5 files."""
+    trajectories: List[DatasetDict] = []
+    hdf5_files = sorted([f for f in os.listdir(dataset_dir) if f.endswith('.hdf5')])
     print(f"Found {len(hdf5_files)} HDF5 files. Loading trajectories...")
-    
+
     for file_idx, hdf5_file in enumerate(hdf5_files):
         if max_trajectories is not None and len(trajectories) >= max_trajectories:
             break
-            
+
         hdf5_path = os.path.join(dataset_dir, hdf5_file)
-        
-        # Extract task description from filename
-        # Format: PREFIX_TASK_NAME_demo.hdf5
         task_name = hdf5_file.replace('_demo.hdf5', '')
-        
-        # Remove uppercase prefixes (e.g., KITCHEN_, SCENE1_, etc.)
-        import re
-        task_description = re.sub(r'^[A-Z0-9_]+_', '', task_name)
-        
-        task_description = task_description.replace('_', ' ').lower()
-        
+        task_desc = re.sub(r'^[A-Z0-9_]+_', '', task_name).replace('_', ' ').lower()
+
         print(f"\nProcessing file {file_idx + 1}/{len(hdf5_files)}: {hdf5_file}")
-        print(f"  Task: {task_description}")
-        
-        # Load demonstrations from this file
+        print(f"  Task: {task_desc}")
+
         with h5py.File(hdf5_path, 'r') as f:
             demo_keys = [k for k in f['data'].keys() if k.startswith('demo_')]
-            demo_indices = [int(k.split('_')[1]) for k in demo_keys]
-            demo_indices.sort()
-            
-            print(f"  Found {len(demo_indices)} demos in this file")
-            
-            # Load demos from each file if we have a limit
+            demo_indices = sorted(int(k.split('_')[1]) for k in demo_keys)
+
             if max_trajectories is not None:
-                # Calculate how many demos to load from this file
-                remaining_trajectories = max_trajectories - len(trajectories)
-                remaining_files = len(hdf5_files) - hdf5_files.index(hdf5_file)
-                max_demos_per_file = max(1, remaining_trajectories // remaining_files) if remaining_files > 0 else 0
+                remaining = max_trajectories - len(trajectories)
+                remaining_files = len(hdf5_files) - file_idx
+                max_demos_per_file = max(1, remaining // max(1, remaining_files))
                 max_demos_per_file = min(max_demos_per_file, len(demo_indices))
             else:
                 max_demos_per_file = len(demo_indices)
-            
+
             print(f"  Loading {max_demos_per_file} demos from this file")
-            
+
             for demo_idx in demo_indices[:max_demos_per_file]:
                 if max_trajectories is not None and len(trajectories) >= max_trajectories:
                     break
-                    
                 try:
-                    traj = load_libero_trajectory(hdf5_path, demo_idx, task_description, max_token_len, action_dim)
+                    traj = load_libero_trajectory(hdf5_path, demo_idx, task_desc,
+                                                  max_token_len, action_dim)
+                    traj["task_name"] = task_desc
                     trajectories.append(traj)
-                    print(f"  ✓ Total loaded: {len(trajectories)}/{max_trajectories if max_trajectories else 'all'}")
+                    print(f"  ✓ Total loaded: {len(trajectories)}/{max_trajectories or 'all'}")
                 except Exception as e:
-                    print(f"  ✗ Warning: Failed to load {hdf5_file} demo_{demo_idx}: {e}")
+                    print(f"  ✗ Warning: Failed {hdf5_file} demo_{demo_idx}: {e}")
                     continue
-    
+
     print(f"Loaded {len(trajectories)} trajectories from {len(hdf5_files)} files")
     return trajectories
 
 
-def load_all_libero_trajectories(dataset_dir: str, max_token_len: int = 48, action_dim: int = 32) -> list:
-    """
-    Load all trajectories from libero_90 dataset.
-    
-    Libero_90 Dataset Structure:
-    ===========================
-    The libero_90 dataset contains 90 different manipulation tasks across 3 scenes:
-    - KITCHEN_SCENE1-10: Kitchen manipulation tasks (50 tasks)
-    - LIVING_ROOM_SCENE1-6: Living room manipulation tasks (30 tasks)  
-    - STUDY_SCENE1-4: Study room manipulation tasks (10 tasks)
-    
-    Each task has multiple demonstration files (e.g., *_demo.hdf5), and each file
-    contains multiple demonstrations (demo_0, demo_1, ..., demo_N) where N varies
-    by task (typically 50 demonstrations per task).
-    
-    Total dataset size: ~4500 trajectories across 90 tasks
-    
-    File naming convention:
-    - KITCHEN_SCENE1_open_the_bottom_drawer_of_the_cabinet_demo.hdf5
-    - LIVING_ROOM_SCENE2_pick_up_the_milk_and_put_it_in_the_basket_demo.hdf5
-    - STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_front_compartment_of_the_caddy_demo.hdf5
-    
-    Each HDF5 file contains:
-    - data/demo_0/ through data/demo_N/ (multiple demonstrations)
-    - Each demo follows the structure described in load_libero_trajectory()
-    
-    Args:
-        dataset_dir: Path to the libero_90 dataset directory
-        max_token_len: Maximum token length for prompt tokenization
-    
-    Returns:
-        List of trajectory dictionaries, each in the format expected by insert_traj
-    """
-    trajectories = []
-    
-    # Get all HDF5 files in the directory
-    hdf5_files = [f for f in os.listdir(dataset_dir) if f.endswith('.hdf5')]
-    hdf5_files.sort()  # Sort for consistent ordering
-    
+def load_all_libero_trajectories(dataset_dir: str,
+                                 max_token_len: int = 48,
+                                 action_dim: int = 32) -> List[DatasetDict]:
+    """Load all LIBERO trajectories."""
+    trajectories: List[DatasetDict] = []
+    hdf5_files = sorted([f for f in os.listdir(dataset_dir) if f.endswith('.hdf5')])
+
     for hdf5_file in hdf5_files:
         hdf5_path = os.path.join(dataset_dir, hdf5_file)
-        
-        # Extract task description from filename
-        # Format: PREFIX_TASK_NAME_demo.hdf5
         task_name = hdf5_file.replace('_demo.hdf5', '')
-        
-        # Remove uppercase prefixes (e.g., KITCHEN_, SCENE1_, etc.)
-        import re
-        task_description = re.sub(r'^[A-Z0-9_]+_', '', task_name)
-        
-        task_description = task_description.replace('_', ' ').lower()
-        
-        # Load all demonstrations from this file
+        task_desc = re.sub(r'^[A-Z0-9_]+_', '', task_name).replace('_', ' ').lower()
+
         with h5py.File(hdf5_path, 'r') as f:
             demo_keys = [k for k in f['data'].keys() if k.startswith('demo_')]
-            demo_indices = [int(k.split('_')[1]) for k in demo_keys]
-            demo_indices.sort()
-            
+            demo_indices = sorted(int(k.split('_')[1]) for k in demo_keys)
+
             for demo_idx in demo_indices:
                 try:
-                    traj = load_libero_trajectory(hdf5_path, demo_idx, task_description, max_token_len, action_dim)
+                    traj = load_libero_trajectory(hdf5_path, demo_idx, task_desc,
+                                                  max_token_len, action_dim)
+                    traj["task_name"] = task_desc
                     trajectories.append(traj)
                 except Exception as e:
-                    print(f"Warning: Failed to load {hdf5_file} demo_{demo_idx}: {e}")
+                    print(f"Warning: Failed {hdf5_file} demo_{demo_idx}: {e}")
                     continue
-    
+
     print(f"Loaded {len(trajectories)} trajectories from {len(hdf5_files)} files")
     return trajectories
+
+
+# ------------------------------
+# Replay Buffer (two-tier)
+# ------------------------------
 
 class TrajReplayBuffer(Dataset):
     """
-    Trajectory-based replay buffer that stores complete trajectories as units.
-    
-    Usage with Libero Data:
-    ======================
-    # Initialize buffer with offline libero data
-    buffer = TrajReplayBuffer(
-        observation_space=obs_space,
-        action_space=action_space, 
-        capacity=1000,  # Number of trajectories, not timesteps
-        use_offline_data=True,  # Load libero_90 dataset on initialization
-        libero_data_dir="/ssd2/EXPO/datasets/libero_90"
-    )
-    
-    # The buffer will automatically load ~4500 trajectories from libero_90
-    # Each trajectory contains:
-    # - RGB images (agentview_rgb, eye_in_hand_rgb): (T, 256, 256, 3)
-    # - Robot states (ee_pos, ee_ori, joint_states, gripper_states)
-    # - Actions: (T, 7) - [x, y, z, qx, qy, qz, qw, gripper]
-    # - Rewards: (T,) - Sparse rewards (1 at goal, 0 otherwise)
-    # - Masks: (T,) - Continuation masks (1 - dones)
-    
-    # Sample random trajectories for training
-    batch = buffer.get_random_trajs(num_trajs=32)
-    
-    # Sample random steps for training
-    batch = buffer.sample(batch_size=256)
-    
-    # Add new online trajectories
-    buffer.insert_traj(new_trajectory)
+    Trajectory-based replay buffer (two-tier: offline pinned + online evictable).
     """
-    def __init__(self, observation_space: gym.Space, action_space: gym.Space, capacity: int, use_offline_data: bool, libero_data_dir: str = "/ssd2/EXPO/datasets/libero_goal", offline_dataset_subset_num: int = None):
+
+    def __init__(self,
+                 observation_space: gym.Space,
+                 action_space: gym.Space,
+                 capacity: int,
+                 use_offline_data: bool,
+                 libero_data_dir: str = "/ssd2/EXPO/datasets/libero_goal",
+                 offline_dataset_subset_num: Optional[int] = None,
+                 batch_offline_ratio: float = 0.5,
+                 success_memory_per_task: int = 10,
+                 eviction: str = "fifo"):
         self.observation_space = observation_space
         self.action_space = action_space
-        self.capacity = capacity  # Total number of steps (timesteps), not trajectories
-        self.use_offline_data = use_offline_data
-        self.libero_data_dir = libero_data_dir
-        self.offline_dataset_subset_num = offline_dataset_subset_num  # Number of trajectories to sample from offline dataset
+        self.capacity = int(capacity)  # in steps
+        self.use_offline_data = bool(use_offline_data)
+        self.libero_data_dir = str(libero_data_dir)
+        self.offline_dataset_subset_num = offline_dataset_subset_num
 
         print("making trajectory replay buffer of capacity ", self.capacity, "steps")
 
-        # Store trajectories as complete units
-        self.trajectories = {}  # traj_id -> trajectory data
-        self.traj_metadata = {}  # traj_id -> metadata (length, etc.)
-        self.size = 0  # Number of trajectories stored
-        self.total_steps = 0  # Total number of steps across all trajectories
+        # Pooled storage
+        # item: {"data": traj_dict, "task": str, "is_success": bool, "pin": bool}
+        self.offline_pool: Dict[str, Dict[str, Any]] = {}
+        self.online_pool:  Dict[str, Dict[str, Any]] = {}
+        self._offline_q: deque[str] = deque()
+        self._online_q:  deque[str] = deque()
+
+        self.offline_size: int = 0  # in steps
+        self.online_size: int = 0
+
+        self.success_memory: Dict[str, deque[str]] = defaultdict(
+            lambda: deque(maxlen=int(success_memory_per_task))
+        )
+        self.batch_offline_ratio = float(batch_offline_ratio)
+        self.eviction = str(eviction)
+
+        self.size = 0            # number of trajectories
+        self.total_steps = 0     # total steps across all trajectories
         self._traj_counter = 0
-        self.streaming_buffer_size = None # this is for streaming the online data
-        
-        # Load offline data if requested
+        self.streaming_buffer_size = None
+
         if self.use_offline_data:
             print("Loading offline libero data...")
             self._load_offline_data()
 
+    # -------- Offline loading --------
+
     def _load_offline_data(self):
-        """Load offline libero data into the buffer."""
         try:
-            # Load trajectories from libero dataset (with subset if specified)
             if self.offline_dataset_subset_num is not None:
-                print(f"\n=== Loading {self.offline_dataset_subset_num} trajectories from libero dataset ===")
+                print(f"\n=== Loading {self.offline_dataset_subset_num} trajectories from LIBERO ===")
                 trajectories = load_sample_libero_trajectories(
-                    self.libero_data_dir, 
-                    max_trajectories=self.offline_dataset_subset_num,
+                    self.libero_data_dir,
+                    max_trajectories=int(self.offline_dataset_subset_num),
                     max_token_len=48,
                     action_dim=32
                 )
             else:
-                print("\n=== Loading all trajectories from libero dataset ===")
-                trajectories = load_all_libero_trajectories(self.libero_data_dir, 48, 32)
-            
+                print("\n=== Loading all trajectories from LIBERO ===")
+                trajectories = load_all_libero_trajectories(
+                    self.libero_data_dir, max_token_len=48, action_dim=32
+                )
+
             print(f"\n=== Inserting {len(trajectories)} trajectories into buffer ===")
-            
-            # Insert trajectories into buffer
             loaded_count = 0
             for traj_idx, traj in enumerate(trajectories):
                 try:
-                    # Check if we have space for this trajectory
-                    if self.total_steps + traj['episode_length'] > self.capacity:
+                    if self.total_steps + int(traj['episode_length']) > self.capacity:
                         print(f"Buffer capacity reached. Loaded {loaded_count} trajectories ({self.total_steps} steps).")
                         break
-                    
-                    self.insert_traj(traj)
+
+                    task_name = traj.get("task_name", "unknown")
+                    is_success = bool(traj.get("is_success", True))
+                    self.insert_traj(traj, source="offline", task=task_name, is_success=is_success)
                     loaded_count += 1
-                    
-                    # Print progress every 10 trajectories
+
                     if loaded_count % 10 == 0:
-                        print(f"  Inserted {loaded_count}/{len(trajectories)} trajectories ({self.total_steps} total steps)")
-                    
+                        print(f"  Inserted {loaded_count}/{len(trajectories)} trajectories "
+                              f"({self.total_steps} total steps)")
+
                 except Exception as e:
                     print(f"  ✗ Warning: Failed to insert trajectory {traj_idx}: {e}")
                     continue
-            
+
             print(f"\n=== Successfully loaded {loaded_count} trajectories into buffer ===")
             print(f"Buffer size: {self.size} trajectories, {self.total_steps} total steps")
-            print(f"Buffer utilization: {self.total_steps / self.capacity * 100:.1f}%")
-            
+            util = 100.0 * self.total_steps / max(1, self.capacity)
+            print(f"Buffer utilization: {util:.1f}%")
+
         except Exception as e:
             print(f"Error loading offline data: {e}")
             print("Continuing with empty buffer...")
 
+    # -------- Basic stats --------
+
     def __len__(self) -> int:
         return self.size
-    
+
     def length(self) -> int:
         return self.size
 
-    def insert_traj(self, traj: DatasetDict):
+    # -------- Insert / Evict --------
+
+    def insert_traj(self, traj: DatasetDict, *,
+                    source: str = "online",
+                    task: Optional[str] = "unknown",
+                    is_success: bool = True):
         """
-        Insert a complete trajectory into the replay buffer.
-        traj should have the structure from collect_trajectory function.
+        Insert a complete trajectory.
         """
-        traj_length = traj['episode_length']
-        
-        # Check if we need to remove old trajectories to make space
-        while self.total_steps + traj_length > self.capacity and self.size > 0:
-            # Remove the oldest trajectory (FIFO)
-            oldest_traj_id = min(self.trajectories.keys())
-            removed_traj = self.trajectories[oldest_traj_id]
-            removed_length = self.traj_metadata[oldest_traj_id]['episode_length']
-            
-            del self.trajectories[oldest_traj_id]
-            del self.traj_metadata[oldest_traj_id]
-            self.size -= 1
-            self.total_steps -= removed_length
-        
-        # Store the complete trajectory
-        traj_id = self._traj_counter
-        self.trajectories[traj_id] = traj
-        self.traj_metadata[traj_id] = {
-            'episode_length': traj_length,
-            'is_success': traj.get('is_success', False),
-            'episode_return': traj.get('episode_return', 0.0),
-            'env_steps': traj.get('env_steps', traj_length)
-        }
-        
+        traj_length = int(traj.get('episode_length', len(traj['actions'])))
+        if 'traj_id' not in traj:
+            traj['traj_id'] = f"traj_{self._traj_counter}"
+        traj_id = str(traj['traj_id'])
+
+        if task is None:
+            task = traj.get('task_name', 'unknown')
+
+        item = dict(data=traj, task=str(task), is_success=bool(is_success))
+        if source == "offline":
+            item["pin"] = True
+            self.offline_pool[traj_id] = item
+            self._offline_q.append(traj_id)
+            self.offline_size += traj_length
+        else:
+            item["pin"] = False
+            self.online_pool[traj_id] = item
+            self._online_q.append(traj_id)
+            self.online_size += traj_length
+
+        if bool(is_success):
+            self.success_memory[str(task)].append(traj_id)
+
         self.size += 1
         self.total_steps += traj_length
         self._traj_counter += 1
 
+        self._rebalance_after_insert()
 
+    def _rebalance_after_insert(self):
+        # Evict ONLY from ONLINE if capacity exceeded
+        while (self.offline_size + self.online_size) > self.capacity:
+            self._evict_from_online()
 
+    def _evict_from_online(self):
+        if not self._online_q:
+            print("[WARN] capacity exceeded but no online traj to evict; consider increasing capacity.")
+            return
+        if self.eviction == "fifo":
+            victim = self._online_q.popleft()
+        else:
+            # priority policy can be added here (e.g., TD-error)
+            victim = self._online_q.popleft()
 
-    def get_random_trajs(self, num_trajs: int):
-        """Sample random trajectories from the buffer."""
-        if self.size == 0:
+        item = self.online_pool.pop(victim, None)
+        if item is not None:
+            T = int(item["data"].get("episode_length", len(item["data"]["actions"])))
+            self.online_size -= T
+            self.size = max(0, self.size - 1)
+            self.total_steps = max(0, self.total_steps - T)
+
+    # -------- Sampling / Iterator --------
+
+    def sample(self,
+               batch_size: int,
+               keys: Optional[Iterable[str]] = None,
+               indx: Optional[np.ndarray] = None,
+               action_horizon: int = 50,
+               action_dim: int = 32,
+               discount_factor: float = 0.99):
+        """
+        Stratified sampling with action horizon chunking.
+
+        Returns:
+            (obs: Observation, actions: [B,H,A], rewards: [B,H], next_obs: Observation, masks: [B])
+        """
+        if (len(self.offline_pool) + len(self.online_pool)) == 0:
             return None
-            
-        available_traj_ids = list(self.trajectories.keys())
-        num_trajs = min(num_trajs, len(available_traj_ids))
-        selected_traj_ids = np.random.choice(available_traj_ids, num_trajs, replace=False)
-        
-        trajectories_list = []
-        
+
+        # 1) choose trajectories (offline:online ratio)
+        k_off = int(round(self.batch_offline_ratio * batch_size))
+        k_on = batch_size - k_off
+
+        off_ids = list(self.offline_pool.keys())
+        on_ids  = list(self.online_pool.keys())
+
+        sel_off, sel_on = [], []
+        if k_off > 0 and len(off_ids) > 0:
+            sel_off = np.random.choice(off_ids, size=min(k_off, len(off_ids)),
+                                       replace=(len(off_ids) < k_off))
+        if k_on > 0 and len(on_ids) > 0:
+            sel_on = np.random.choice(on_ids, size=min(k_on, len(on_ids)),
+                                      replace=(len(on_ids) < k_on))
+
+        need = batch_size - (len(sel_off) + len(sel_on))
+        if need > 0:
+            remain = list(set(on_ids) - set(sel_on)) if len(on_ids) > 0 else []
+            if len(remain) > 0:
+                extra = np.random.choice(remain, size=min(need, len(remain)),
+                                         replace=(len(remain) < need))
+                sel_on = list(sel_on) + list(extra)
+                need = batch_size - (len(sel_off) + len(sel_on))
+            if need > 0 and len(off_ids) > 0:
+                remain = list(set(off_ids) - set(sel_off))
+                if len(remain) > 0:
+                    extra = np.random.choice(remain, size=min(need, len(remain)),
+                                             replace=(len(remain) < need))
+                    sel_off = list(sel_off) + list(extra)
+
+        selected_traj_ids = list(sel_off) + list(sel_on)
+
+        # 2) build chunked batch
+        observations_list, next_observations_list = [], []
+        actions_list, rewards_list, masks_list = [], [], []
+
         for traj_id in selected_traj_ids:
-            traj = self.trajectories[traj_id]
-            
-            # Create next_observations by shifting by 1 timestep
-            next_traj = {}
-            for k, v in traj.items():
-                if k in ['actions', 'rewards', 'masks', 'is_success', 'episode_return', 'episode_length', 'env_steps']:
-                    # Copy metadata as is
-                    next_traj[k] = v
-                else:
-                    # Shift observation data by 1 timestep
-                    if len(v) > 1:
-                        next_traj[k] = np.concatenate([v[1:], v[-1:]], axis=0)
-                    else:
-                        next_traj[k] = v
-            
-            # Create trajectory with next observations
-            traj_with_next = {
-                'observations': traj,
-                'next_observations': next_traj,
-                'actions': traj['actions'],
-                'rewards': traj['rewards'],
-                'terminals': 1 - traj['masks'],  # terminals = 1 - masks
-                'masks': traj['masks'],
+            item = self.offline_pool.get(traj_id) or self.online_pool.get(traj_id)
+            assert item is not None, f"missing traj {traj_id}"
+            traj = item["data"]
+
+            T = int(traj['episode_length'])
+            t = np.random.randint(0, T) if T > 1 else 0
+
+            # single-step obs at t
+            obs_t = {
+                'base_img': traj['base_img'][t],
+                'wrist_img': traj['wrist_img'][t],
+                'base_img_mask': traj['base_img_mask'][t],
+                'wrist_img_mask': traj['wrist_img_mask'][t],
+                'state': traj['state'][t],
+                'tokenized_prompt': traj['tokenized_prompt'][t],
+                'tokenized_prompt_mask': traj['tokenized_prompt_mask'][t],
             }
-            
-            trajectories_list.append(traj_with_next)
-        
-        return trajectories_list
 
-    def sample(self, batch_size: int, keys: Optional[Iterable[str]] = None, indx: Optional[np.ndarray] = None, action_horizon: int = 50, action_dim: int = 32, discount_factor: float = 0.99):
-        """Sample random steps from the buffer with action horizon."""
-        if self.size == 0:
-            return None
-            
-        # Sample random trajectories first
-        available_traj_ids = list(self.trajectories.keys())
-        # Sample batch_size trajectories with replacement to get the desired batch size
-        selected_traj_ids = np.random.choice(available_traj_ids, batch_size, replace=True)
-        
-        observations_list = []
-        next_observations_list = []
-        actions_list = []
-        rewards_list = []
-        terminals_list = []
-        masks_list = []
-        
-        for traj_id in selected_traj_ids:
-            traj = self.trajectories[traj_id]
-            
-            # Sample a random timestep from this trajectory
-            traj_length = traj['episode_length']
-            if traj_length > 1:
-                t = np.random.randint(0, traj_length)
+            # H-step action chunk (pad with last)
+            rem_actions = traj['actions'][t:]
+            if len(rem_actions) >= action_horizon:
+                act_seq = rem_actions[:action_horizon]
             else:
-                t = 0
-            
-            # Extract single timestep observation
-            obs = {}
-            for k, v in traj.items():
-                if k in ['actions', 'rewards', 'masks', 'is_success', 'episode_return', 'episode_length', 'env_steps']:
-                    # Skip metadata fields
-                    continue
-                else:
-                    # Extract single timestep
-                    obs[k] = v[t]
-            
-            # Extract action horizon from this timestep
-            # If not enough actions remaining, repeat the last action
-            remaining_actions = traj['actions'][t:]
-            if len(remaining_actions) >= action_horizon:
-                action_sequence = remaining_actions[:action_horizon]
+                last_action = rem_actions[-1:] if len(rem_actions) > 0 else traj['actions'][-1:]
+                pad_n = action_horizon - len(rem_actions)
+                act_seq = np.concatenate([rem_actions, np.tile(last_action, (pad_n, 1))], axis=0)
+
+            # pad action from 7D → action_dim (keep original 7 dims; rest zeros)
+            if action_dim > act_seq.shape[1]:
+                pad = np.zeros((action_horizon, action_dim - act_seq.shape[1]), dtype=act_seq.dtype)
+                act_seq = np.concatenate([act_seq, pad], axis=1)
+
+            # next obs at t+H (clamped)
+            next_t = min(t + action_horizon, T - 1)
+            next_obs_t = {
+                'base_img': traj['base_img'][next_t],
+                'wrist_img': traj['wrist_img'][next_t],
+                'base_img_mask': traj['base_img_mask'][next_t],
+                'wrist_img_mask': traj['wrist_img_mask'][next_t],
+                'state': traj['state'][next_t],
+                'tokenized_prompt': traj['tokenized_prompt'][next_t],
+                'tokenized_prompt_mask': traj['tokenized_prompt_mask'][next_t],
+            }
+
+            # H rewards (pad zeros)
+            rem_rewards = traj['rewards'][t:]
+            if len(rem_rewards) >= action_horizon:
+                rew_seq = rem_rewards[:action_horizon]
             else:
-                # Pad with last action if not enough remaining
-                last_action = remaining_actions[-1:] if len(remaining_actions) > 0 else traj['actions'][-1:]
-                padding_needed = action_horizon - len(remaining_actions)
-                action_sequence = np.concatenate([
-                    remaining_actions,
-                    np.tile(last_action, (padding_needed, 1))
-                ])
-            
-            # Pad action from 7D to action_dim (32D) - first 7 dimensions are original action, rest are zeros
-            if action_dim > 7:
-                padding = np.zeros((action_horizon, action_dim - 7))
-                action_sequence_padded = np.concatenate([action_sequence, padding], axis=1)
-            else:
-                action_sequence_padded = action_sequence
-            
-            # Extract next observation after action_horizon steps
-            next_t = min(t + action_horizon, traj_length - 1)
-            next_obs = {}
-            for k, v in traj.items():
-                if k in ['actions', 'rewards', 'masks', 'is_success', 'episode_return', 'episode_length', 'env_steps']:
-                    # Skip metadata fields
-                    continue
-                else:
-                    # Extract observation at next_t
-                    next_obs[k] = v[next_t]
-            
-            # Calculate n-step discounted reward sum
-            # Extract rewards for action_horizon steps
-            remaining_rewards = traj['rewards'][t:]
-            if len(remaining_rewards) >= action_horizon:
-                reward_sequence = remaining_rewards[:action_horizon]
-            else:
-                # Pad with zeros if not enough remaining rewards
-                padding_needed = action_horizon - len(remaining_rewards)
-                reward_sequence = np.concatenate([
-                    remaining_rewards,
-                    np.zeros(padding_needed)
-                ])
-            
-            # # Calculate discounted sum
-            # discounts = np.array([discount_factor ** i for i in range(action_horizon)])
-            # n_step_reward = np.sum(reward_sequence * discounts)
-            
-            observations_list.append(obs)
-            next_observations_list.append(next_obs)
-            actions_list.append(action_sequence_padded)  # Shape: (action_horizon, action_dim)
-            rewards_list.append(reward_sequence)  # Shape: (action_horizon,) - reward sequence for chunk RL
-            terminals_list.append(1 - traj['masks'][t])  # terminals = 1 - masks
+                pad_n = action_horizon - len(rem_rewards)
+                rew_seq = np.concatenate([rem_rewards, np.zeros(pad_n, dtype=rem_rewards.dtype)], axis=0)
+
+            observations_list.append(obs_t)
+            next_observations_list.append(next_obs_t)
+            actions_list.append(act_seq.astype(np.float32))
+            rewards_list.append(rew_seq.astype(np.float32))
             masks_list.append(bool(traj['masks'][t]))
-        
-        # Convert lists to arrays with batch dimension as axis 0
-        # batch = {}
-        
-        # Process observations - convert to _model.Observation format
-        batch_obs = {}
-        batch_next_obs = {}
-        
-        # Stack all observation fields with batch dimension as axis 0
-        for k in observations_list[0].keys():
-            batch_obs[k] = np.stack([obs[k] for obs in observations_list], axis=0)
-            batch_next_obs[k] = np.stack([next_obs[k] for next_obs in next_observations_list], axis=0)
-        
-        # Convert to _model.Observation format
-        # Reconstruct the nested structure expected by Observation.from_dict
+
+        # 3) stack into Observation batch
+        def stack_field(lst, key):
+            return np.stack([e[key] for e in lst], axis=0)
+
+        batch_obs = {k: stack_field(observations_list, k) for k in observations_list[0].keys()}
+        batch_next_obs = {k: stack_field(next_observations_list, k) for k in next_observations_list[0].keys()}
+
         obs_dict = {
             'image': {
-                'base_0_rgb': batch_obs['base_img'],  # [batch_size, 224, 224, 3]
-                'left_wrist_0_rgb': batch_obs['wrist_img'],  # [batch_size, 224, 224, 3]
-                'right_wrist_0_rgb': np.zeros_like(batch_obs['base_img'])  # [batch_size, 224, 224, 3]
+                'base_0_rgb': batch_obs['base_img'],              # [B, 224, 224, 3]
+                'left_wrist_0_rgb': batch_obs['wrist_img'],
+                'right_wrist_0_rgb': np.zeros_like(batch_obs['base_img']),
             },
             'image_mask': {
-                'base_0_rgb': batch_obs['base_img_mask'],  # [batch_size]
-                'left_wrist_0_rgb': batch_obs['wrist_img_mask'],  # [batch_size]
-                'right_wrist_0_rgb': np.zeros_like(batch_obs['base_img_mask'], dtype=bool)  # [batch_size]
+                'base_0_rgb': batch_obs['base_img_mask'],         # [B]
+                'left_wrist_0_rgb': batch_obs['wrist_img_mask'],  # [B]
+                'right_wrist_0_rgb': np.zeros_like(batch_obs['base_img_mask'], dtype=bool),
             },
-            'state': batch_obs['state'],  # [batch_size, 7]
-            'tokenized_prompt': batch_obs['tokenized_prompt'],  # [batch_size, d]
-            'tokenized_prompt_mask': batch_obs['tokenized_prompt_mask']  # [batch_size, d]
+            'state': batch_obs['state'],                          # [B, S]
+            'tokenized_prompt': batch_obs['tokenized_prompt'],    # [B, L]
+            'tokenized_prompt_mask': batch_obs['tokenized_prompt_mask'],
         }
-        
+
         next_obs_dict = {
             'image': {
-                'base_0_rgb': batch_next_obs['base_img'],  # [batch_size, 224, 224, 3]
-                'left_wrist_0_rgb': batch_next_obs['wrist_img'],  # [batch_size, 224, 224, 3]
-                'right_wrist_0_rgb': np.zeros_like(batch_next_obs['base_img'])  # [batch_size, 224, 224, 3]
+                'base_0_rgb': batch_next_obs['base_img'],
+                'left_wrist_0_rgb': batch_next_obs['wrist_img'],
+                'right_wrist_0_rgb': np.zeros_like(batch_next_obs['base_img']),
             },
             'image_mask': {
-                'base_0_rgb': batch_next_obs['base_img_mask'],  # [batch_size]
-                'left_wrist_0_rgb': batch_next_obs['wrist_img_mask'],  # [batch_size]
-                'right_wrist_0_rgb': np.zeros_like(batch_next_obs['base_img_mask'], dtype=bool)  # [batch_size]
+                'base_0_rgb': batch_next_obs['base_img_mask'],
+                'left_wrist_0_rgb': batch_next_obs['wrist_img_mask'],
+                'right_wrist_0_rgb': np.zeros_like(batch_next_obs['base_img_mask'], dtype=bool),
             },
-            'state': batch_next_obs['state'],  # [batch_size, 7]
-            'tokenized_prompt': batch_next_obs['tokenized_prompt'],  # [batch_size, d]
-            'tokenized_prompt_mask': batch_next_obs['tokenized_prompt_mask']  # [batch_size, d]
+            'state': batch_next_obs['state'],
+            'tokenized_prompt': batch_next_obs['tokenized_prompt'],
+            'tokenized_prompt_mask': batch_next_obs['tokenized_prompt_mask'],
         }
-        
-        # # Convert to JAX arrays and create Observation objects
-        obs_dict["image"] = {k: jax.numpy.array(v) for k, v in obs_dict["image"].items()}
-        obs_dict["image_mask"] = {k: jax.numpy.array(v) for k, v in obs_dict["image_mask"].items()}
-        obs_dict["state"] = jax.numpy.array(obs_dict["state"], dtype=jnp.float32)
-        obs_dict["tokenized_prompt"] = jax.numpy.array(obs_dict["tokenized_prompt"], dtype=jnp.int32)
-        obs_dict["tokenized_prompt_mask"] = jax.numpy.array(obs_dict["tokenized_prompt_mask"], dtype=jnp.bool_)
-        
-        next_obs_dict["image"] = {k: jax.numpy.array(v) for k, v in next_obs_dict["image"].items()}
-        next_obs_dict["image_mask"] = {k: jax.numpy.array(v) for k, v in next_obs_dict["image_mask"].items()}
-        next_obs_dict["state"] = jax.numpy.array(next_obs_dict["state"], dtype=jnp.float32)
-        next_obs_dict["tokenized_prompt"] = jax.numpy.array(next_obs_dict["tokenized_prompt"], dtype=jnp.int32)
-        next_obs_dict["tokenized_prompt_mask"] = jax.numpy.array(next_obs_dict["tokenized_prompt_mask"], dtype=jnp.bool_)
-        
+
+        # to jax arrays
+        def to_jax_obs(d):
+            d["image"] = {k: jax.numpy.array(v) for k, v in d["image"].items()}
+            d["image_mask"] = {k: jax.numpy.array(v) for k, v in d["image_mask"].items()}
+            d["state"] = jax.numpy.array(d["state"], dtype=jnp.float32)
+            d["tokenized_prompt"] = jax.numpy.array(d["tokenized_prompt"], dtype=jnp.int32)
+            d["tokenized_prompt_mask"] = jax.numpy.array(d["tokenized_prompt_mask"], dtype=jnp.bool_)
+            return d
+
+        obs_o = _model.Observation.from_dict(to_jax_obs(obs_dict))
+        nxt_o = _model.Observation.from_dict(to_jax_obs(next_obs_dict))
 
         batch = (
-            _model.Observation.from_dict(obs_dict),
-            np.stack(actions_list, axis=0).astype(np.float32),
-            np.stack(rewards_list, axis=0).astype(np.float32),
-            _model.Observation.from_dict(next_obs_dict),
-            np.stack(masks_list, axis=0).astype(np.bool_)
+            obs_o,
+            np.stack(actions_list, axis=0).astype(np.float32),   # [B,H,A]
+            np.stack(rewards_list, axis=0).astype(np.float32),   # [B,H]
+            nxt_o,
+            np.stack(masks_list, axis=0).astype(np.bool_),       # [B]
         )
-        
         return batch
 
-    def get_iterator(self, batch_size: int, keys: Optional[Iterable[str]] = None, indx: Optional[np.ndarray] = None, queue_size: int = 2, action_horizon: int = 50, action_dim: int = 32, discount_factor: float = 0.99):
-        """Get an iterator for the buffer data."""
-        # See https://flax.readthedocs.io/en/latest/_modules/flax/jax_utils.html#prefetch_to_device
-        # queue_size = 2 should be ok for one GPU.
-
+    def get_iterator(self,
+                     batch_size: int,
+                     keys: Optional[Iterable[str]] = None,
+                     indx: Optional[np.ndarray] = None,
+                     queue_size: int = 2,
+                     action_horizon: int = 50,
+                     action_dim: int = 32,
+                     discount_factor: float = 0.99):
+        """Prefetching iterator (deque-based)."""
         queue = collections.deque()
 
         def enqueue(n):
@@ -854,57 +619,90 @@ class TrajReplayBuffer(Dataset):
             yield queue.popleft()
             enqueue(1)
 
-    def compute_action_stats(self):
-        """Compute action statistics for normalization."""
+    # -------- Stats / Normalization --------
+
+    def compute_action_stats(self) -> Dict[str, np.ndarray]:
         all_actions = []
-        for traj in self.trajectories.values():
-            all_actions.append(traj['actions'])
-        
+        for it in self.offline_pool.values():
+            all_actions.append(it["data"]["actions"])
+        for it in self.online_pool.values():
+            all_actions.append(it["data"]["actions"])
         if all_actions:
-            all_actions = np.concatenate(all_actions, axis=0)
-            return {'mean': all_actions.mean(axis=0), 'std': all_actions.std(axis=0)}
+            A = np.concatenate(all_actions, axis=0)
+            return {'mean': A.mean(axis=0), 'std': A.std(axis=0)}
         else:
-            return {'mean': np.zeros(self.action_space.shape[0]), 'std': np.ones(self.action_space.shape[0])}
+            return {'mean': np.zeros(self.action_space.shape[0]),
+                    'std': np.ones(self.action_space.shape[0])}
 
-    def normalize_actions(self, action_stats):
-        """Normalize actions using provided statistics."""
-        # do not normalize gripper dimension (last dimension)
-        action_stats = copy.deepcopy(action_stats)
-        action_stats['mean'][-1] = 0
-        action_stats['std'][-1] = 1
-        
-        for traj_id, traj in self.trajectories.items():
-            normalized_actions = (traj['actions'] - action_stats['mean']) / action_stats['std']
-            self.trajectories[traj_id]['actions'] = normalized_actions
+    def normalize_actions(self, action_stats: Dict[str, np.ndarray]):
+        # do not normalize gripper dimension (last dim)
+        stats = copy.deepcopy(action_stats)
+        stats['mean'][-1] = 0
+        stats['std'][-1] = 1
+        eps = 1e-8
+        for pool in (self.offline_pool, self.online_pool):
+            for it in pool.values():
+                A = it["data"]["actions"]
+                it["data"]["actions"] = (A - stats['mean']) / (stats['std'] + eps)
 
-    def save(self, filename):
-        """Save buffer to file."""
+    # -------- Save / Restore --------
+
+    def save(self, filename: str):
         save_dict = dict(
-            trajectories=self.trajectories,
-            traj_metadata=self.traj_metadata,
+            offline_pool=self.offline_pool,
+            online_pool=self.online_pool,
+            offline_q=list(self._offline_q),
+            online_q=list(self._online_q),
+            offline_size=self.offline_size,
+            online_size=self.online_size,
             size=self.size,
             total_steps=self.total_steps,
             _traj_counter=self._traj_counter,
             capacity=self.capacity,
             observation_space=self.observation_space,
-            action_space=self.action_space
+            action_space=self.action_space,
+            batch_offline_ratio=self.batch_offline_ratio,
+            eviction=self.eviction,
         )
         with open(filename, 'wb') as f:
             pickle.dump(save_dict, f, protocol=4)
 
-    def restore(self, filename):
-        """Restore buffer from file."""
+    def restore(self, filename: str):
         with open(filename, 'rb') as f:
-            save_dict = pickle.load(f)
-        
-        self.trajectories = save_dict['trajectories']
-        self.traj_metadata = save_dict['traj_metadata']
-        self.size = save_dict['size']
-        self.total_steps = save_dict.get('total_steps', 0)  # Backward compatibility
-        self._traj_counter = save_dict['_traj_counter']
-        self.capacity = save_dict['capacity']
-        self.observation_space = save_dict['observation_space']
-        self.action_space = save_dict['action_space']
+            d = pickle.load(f)
+        self.offline_pool = d['offline_pool']
+        self.online_pool  = d['online_pool']
+        self._offline_q = deque(d['offline_q'])
+        self._online_q  = deque(d['online_q'])
+        self.offline_size = d['offline_size']
+        self.online_size  = d['online_size']
+        self.size = d['size']
+        self.total_steps = d['total_steps']
+        self._traj_counter = d['_traj_counter']
+        self.capacity = d['capacity']
+        self.observation_space = d['observation_space']
+        self.action_space = d['action_space']
+        self.batch_offline_ratio = d.get('batch_offline_ratio', self.batch_offline_ratio)
+        self.eviction = d.get('eviction', self.eviction)
 
+    # -------- Convenience (optional) --------
 
+    def get_traj(self, traj_id: str) -> Optional[DatasetDict]:
+        it = self.offline_pool.get(traj_id) or self.online_pool.get(traj_id)
+        return None if it is None else it["data"]
 
+    def iter_trajs(self):
+        for it in self.offline_pool.values():
+            yield it["data"]
+        for it in self.online_pool.values():
+            yield it["data"]
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "offline_trajs": len(self.offline_pool),
+            "online_trajs": len(self.online_pool),
+            "offline_size": self.offline_size,
+            "online_size": self.online_size,
+            "total_steps": self.total_steps,
+            "num_trajs": self.size,
+        }

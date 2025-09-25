@@ -38,7 +38,6 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
 from openpi.training.expo_buffer import TrajReplayBuffer
-from openpi.training.retriever import SimpleRetriever
 from openpi.training.expo_train_utils import (
     get_libero_env,
     collect_trajectory,
@@ -191,8 +190,6 @@ def train_step(
     rng: at.KeyArrayLike,
     state: training_utils.TrainStatePi0Expo,
     batch: tuple[_model.Observation, _model.Actions, at.Float[at.Array, "b H"], _model.Observation, at.Bool[at.Array, "b"]],
-    retrieval_now: at.Array | None,
-    retrieval_next: at.Array | None,
 ) -> tuple[training_utils.TrainStatePi0Expo, dict[str, at.Array]]:
     model = nnx.merge(
         state.model_def,
@@ -223,9 +220,8 @@ def train_step(
         rewards: at.Float[at.Array, "b H"],
         next_observation: _model.Observation,
         masks: at.Bool[at.Array, "b"],
-        retrieval_actions,
     ):
-        return model.critic_loss(rng, observation, actions, rewards, next_observation, masks, train=True, retrieval_actions=retrieval_actions)
+        return model.critic_loss(rng, observation, actions, rewards, next_observation, masks, train=True)
     
 
     @at.typecheck
@@ -234,9 +230,8 @@ def train_step(
         rng: at.KeyArrayLike,
         observation: _model.Observation,
         actions: _model.Actions,
-        retrieval_actions,
     ):
-        loss, entropy = model.edit_actor_loss(rng, observation, actions, train=True, retrieval_actions=retrieval_actions)
+        loss, entropy = model.edit_actor_loss(rng, observation, actions, train=True)
         return loss, entropy
     
     @at.typecheck
@@ -259,7 +254,7 @@ def train_step(
     diff_state_temp = nnx.DiffState(0, nnx.All(lambda path, _: path[0]=='temp', config.trainable_filter))
     grad_temp_fn = nnx.value_and_grad(temperature_loss_fn, argnums=diff_state_temp)
 
-    critic_loss, critic_grads = grad_critic_fn(model, train_rng_critic, observation, actions, rewards, next_observation, masks, retrieval_next)
+    critic_loss, critic_grads = grad_critic_fn(model, train_rng_critic, observation, actions, rewards, next_observation, masks)
     critic_params = state.critic_params.filter(config.trainable_filter)
     updates_c, new_critic_opt_state = state.tx_critic.update(critic_grads, state.critic_opt_state, critic_params)
     new_critic_params = optax.apply_updates(critic_params, updates_c)
@@ -281,7 +276,7 @@ def train_step(
     new_actor_params = optax.apply_updates(actor_params, updates_a)
 
 
-    (edit_actor_loss, entropy), edit_actor_grads = grad_edit_actor_fn(model, train_rng_edit_actor, observation, actions, retrieval_now)
+    (edit_actor_loss, entropy), edit_actor_grads = grad_edit_actor_fn(model, train_rng_edit_actor, observation, actions)
     edit_actor_params = state.edit_actor_params.filter(config.trainable_filter)
     updates_e, new_edit_actor_opt_state = state.tx_edit_actor.update(edit_actor_grads, state.edit_actor_opt_state, edit_actor_params)
     new_edit_actor_params = optax.apply_updates(edit_actor_params, updates_e)
@@ -322,6 +317,70 @@ def train_step(
 
     return new_state, info
 
+def _check_batch_shapes(b, B, H, A):
+    obs, actions, rewards, next_obs, masks = b
+    # actions: (B, H, A), rewards: (B, H), masks: (B,)
+    assert actions.shape == (B, H, A), actions.shape
+    assert rewards.shape == (B, H), rewards.shape
+    assert masks.shape == (B,), masks.shape
+
+    # obs 이미지들
+    for k, v in obs.images.items():
+        assert v.shape[0] == B, (k, v.shape)
+    for k, v in obs.image_masks.items():
+        assert v.shape[0] == B, (k, v.shape)
+    assert obs.state.shape[0] == B
+    assert obs.tokenized_prompt.shape[0] == B
+    assert obs.tokenized_prompt_mask.shape[0] == B
+
+    # next_obs도 동일
+    for k, v in next_obs.images.items():
+        assert v.shape[0] == B, (k, v.shape)
+    for k, v in next_obs.image_masks.items():
+        assert v.shape[0] == B, (k, v.shape)
+    assert next_obs.state.shape[0] == B
+    assert next_obs.tokenized_prompt.shape[0] == B
+    assert next_obs.tokenized_prompt_mask.shape[0] == B
+
+def debug_print_shardings(py):
+    leaves = jax.tree_util.tree_leaves(py, is_leaf=lambda x: isinstance(x, (np.ndarray, jax.Array)))
+    for i, x in enumerate(leaves[:30]):  # 너무 길면 앞부분만
+        if isinstance(x, jax.Array):
+            print(f"leaf[{i}]: shape={x.shape}, sharding={x.sharding}")
+        else:
+            print(f"leaf[{i}]: np shape={x.shape}, (not yet on device)")
+
+def shard_observation(obs, data_sharding):
+    d = obs.to_dict()  # 모든 field 노출
+    d = jax.tree_util.tree_map(
+        lambda x: jax.device_put(x, data_sharding) if isinstance(x, (np.ndarray, jax.Array)) else x,
+        d
+    )
+    return _model.Observation.from_dict(d)
+
+def shard_batch_strict(batch, data_sharding, mesh):
+    # batch = (obs, actions, rewards, next_obs, masks)
+    obs, actions, rewards, next_obs, masks = batch
+    with sharding.set_mesh(mesh):
+        obs_s      = shard_observation(obs, data_sharding)
+        next_obs_s = shard_observation(next_obs, data_sharding)
+        actions_s  = jax.device_put(actions.astype(np.float32), data_sharding)
+        rewards_s  = jax.device_put(rewards.astype(np.float32), data_sharding)
+        masks_s    = jax.device_put(masks.astype(bool), data_sharding)
+    return (obs_s, actions_s, rewards_s, next_obs_s, masks_s)
+
+def _to_host_np(x):
+    import numpy as _np, jax as _jax
+    try:
+        return _np.asarray(_jax.device_get(x))
+    except Exception:
+        return _np.asarray(x)
+
+def _preview_images_from_obs(obs, k=5):
+    stacks = [_to_host_np(v) for v in obs.images.values()]  # obs.images는 이제 JAX Array지만 unsharded
+    B = min(k, stacks[0].shape[0])
+    return [wandb.Image(np.concatenate([s[i] for s in stacks], axis=1)) for i in range(B)]
+
 
 def main(config: _config.TrainConfig):
     init_logging()
@@ -354,13 +413,10 @@ def main(config: _config.TrainConfig):
     replay_buffer = TrajReplayBuffer(
         observation_space=create_expo_obs_space(),
         action_space=create_expo_action_space(),
-        capacity=config.buffer.capacity_total,
+        capacity=config.capacity,
         use_offline_data=config.use_offline_data,
         libero_data_dir=config.libero_data_dir,
         offline_dataset_subset_num=config.offline_dataset_subset_num,
-        batch_offline_ratio=config.buffer.batch_offline_ratio,
-        success_memory_per_task=config.buffer.success_memory_per_task,
-        eviction=config.buffer.eviction,
     )
     data_iter = replay_buffer.get_iterator(
         config.batch_size,
@@ -402,39 +458,12 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized train state - edit_actor:\n{training_utils.array_tree_to_info(train_state.edit_actor_params)}")
     logging.info(f"Initialized train state - temp:\n{training_utils.array_tree_to_info(train_state.temp_params)}")
 
-    # === [ADD] 평가용 모델 빌더 (critic trunk 임베딩에 사용) ===
-    def _build_eval_model(state):
-        model = nnx.merge(
-            state.model_def,
-            state.critic_params,
-            state.target_critic_params,
-            state.actor_params,
-            state.edit_actor_params,
-            state.temp_params,
-        )
-        model.eval()
-        return model
-
-    # === [ADD] Retriever 초기화 ===
-    retriever = None
-    if config.retrieval.enabled:
-        model_eval = _build_eval_model(train_state)
-        retriever = SimpleRetriever(
-            H=config.action_horizon,
-            A=config.action_dim,
-            success_only=config.retrieval.success_only,
-            topk=config.retrieval.topk,
-            alpha_q=config.retrieval.alpha_q,
-        )
-        # 오프라인으로 초기 인덱스 구축
-        retriever.build_from_buffer(model_eval, replay_buffer)
-
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding,data_sharding,data_sharding),
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
@@ -493,38 +522,8 @@ def main(config: _config.TrainConfig):
         # batch = shard_batch_strict(batch, data_sharding, mesh)
         # _check_batch_shapes(batch, config.batch_size, config.action_horizon, config.action_dim)
         # debug_print_shardings(batch)
-
-        if retriever is not None and config.retrieval.enabled:
-            do_refresh = False
-            # 1) 주기적 리프레시
-            if step % config.retrieval.refresh_every == 0:
-                do_refresh = True
-            # 2) 방금 온라인 데이터 들어왔으면 즉시 리프레시(너무 자주면 빼도 됨)
-            if step >= config.offline_steps and (step % config.rollout_interval == 0):
-                do_refresh = True
-
-            if do_refresh:
-                model_eval = _build_eval_model(train_state)
-                retriever.build_from_buffer(model_eval, replay_buffer)
-
-        # (B) 배치 기준 리트리벌 후보 추출
-        obs_b, _, _, next_obs_b, _ = batch
-        if retriever is not None and config.retrieval.enabled:
-            # 현재 상태용 후보
-            model_eval = _build_eval_model(train_state)  # 가볍게 최신 파라미터 반영
-            retrieval_now = retriever.query_actions(model_eval, obs_b)  # [B,R,H,A] (또는 None)
-            # 타깃(critic target)용 후보
-            if getattr(config.retrieval, "use_for_targets", True):
-                retrieval_next = retriever.query_actions(model_eval, next_obs_b)
-            else:
-                retrieval_next = None
-        else:
-            retrieval_now = None
-            retrieval_next = None
-
-
         with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch, retrieval_now, retrieval_next)
+            train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
