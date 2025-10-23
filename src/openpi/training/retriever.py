@@ -18,11 +18,10 @@ class SimpleRetriever:
     
     def build_from_buffer(self, model, buffer):
         # 버퍼의 모든 timestep에서 obs 임베딩(key)와 그 시점부터 H-step action chunk 추출
-        keys, chunks, qhint = []
         keys, chunks, qhint = [], [], []
-        for traj in buffer.trajectories.values():
+        for traj in buffer.iter_trajs():
             T = traj['episode_length']
-            suc = float(traj.get('is_success', False))
+            # suc = float(traj.get('is_success', False))
             R = traj['rewards']    # (T,)
             A = traj['actions']    # (T, orig or padded)
             # 관측을 expo 포맷으로 꺼내기 (buffer.sample 참조)
@@ -32,13 +31,13 @@ class SimpleRetriever:
             # 관측 단일 step -> Observation 만들기
             for t in range(T):
                 obs_dict = {
-                  'image': {'base_0_rgb': base[t:t+1], 'left_wrist_0_rgb': wrist[t:t+1], 'right_wrist_0_rgb': np.zeros_like(base[t:t+1])},
-                  'image_mask': {'base_0_rgb': base_m[t:t+1], 'left_wrist_0_rgb': wrist_m[t:t+1], 'right_wrist_0_rgb': np.zeros_like(base_m[t:t+1], dtype=bool)},
-                  'state': state[t:t+1],
-                  'tokenized_prompt': tok[t:t+1],
-                  'tokenized_prompt_mask': tok_m[t:t+1],
+                  'image': {'base_0_rgb': jnp.array(base[t:t+1]), 'left_wrist_0_rgb': jnp.array(wrist[t:t+1]), 'right_wrist_0_rgb': jnp.zeros_like(jnp.array(base[t:t+1]))},
+                  'image_mask': {'base_0_rgb': jnp.array(base_m[t:t+1]), 'left_wrist_0_rgb': jnp.array(wrist_m[t:t+1]), 'right_wrist_0_rgb': jnp.zeros_like(jnp.array(base_m[t:t+1]), dtype=bool)},
+                  'state': jnp.array(state[t:t+1]),
+                  'tokenized_prompt': jnp.array(tok[t:t+1]),
+                  'tokenized_prompt_mask': jnp.array(tok_m[t:t+1]),
                 }
-                obs = _model.Observation.from_dict({k: {**v} if isinstance(v, dict) else v for k,v in obs_dict.items()})
+                obs = _model.Observation.from_dict(obs_dict)
                 # trunk embedding
                 z = model.critic.base_cls.trunk(obs, train=False)  # [1,D]
                 keys.append(np.asarray(z)[0])
@@ -49,7 +48,13 @@ class SimpleRetriever:
                 if len(chunk) < self.H:
                     pad = np.tile(chunk[-1:], (self.H-len(chunk), 1))
                     chunk = np.concatenate([chunk, pad], axis=0)
-                chunks.append(chunk[:, :self.A])
+                
+                # Pad action from 7D to action_dim (keep original 7 dims; rest zeros)
+                if self.A > chunk.shape[1]:
+                    pad = np.zeros((self.H, self.A - chunk.shape[1]), dtype=chunk.dtype)
+                    chunk = np.concatenate([chunk, pad], axis=1)
+                
+                chunks.append(chunk)
                 # 간단 Q 힌트: 향후 H 보상합
                 qhint.append(R[t:h_end].sum())
 

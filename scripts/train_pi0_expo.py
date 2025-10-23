@@ -223,7 +223,7 @@ def train_step(
         rewards: at.Float[at.Array, "b H"],
         next_observation: _model.Observation,
         masks: at.Bool[at.Array, "b"],
-        retrieval_actions,
+        retrieval_actions: at.Float[at.Array, "*b k ah ad"],
     ):
         return model.critic_loss(rng, observation, actions, rewards, next_observation, masks, train=True, retrieval_actions=retrieval_actions)
     
@@ -234,7 +234,7 @@ def train_step(
         rng: at.KeyArrayLike,
         observation: _model.Observation,
         actions: _model.Actions,
-        retrieval_actions,
+        retrieval_actions: at.Float[at.Array, "*b k ah ad"],
     ):
         loss, entropy = model.edit_actor_loss(rng, observation, actions, train=True, retrieval_actions=retrieval_actions)
         return loss, entropy
@@ -326,6 +326,9 @@ def train_step(
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
+    
+    # Start memory tracing for debugging
+    tracemalloc.start()
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(

@@ -20,8 +20,8 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 # export NCCL_DEBUG=WARN
 
 
-python openpi_official/scripts/train_pi0_expo.py pi0_expo_libero \
-  --exp-name=exp4 \
+python scripts/train_pi0_expo.py pi0_expo_libero \
+  --exp-name=exp5 \
   --num-train-steps=50_000 \
   --batch-size=32 \
   --seed=64 \
@@ -31,10 +31,10 @@ python openpi_official/scripts/train_pi0_expo.py pi0_expo_libero \
   --overwrite \
   --no-resume\
   --use-offline-data \
-  --offline-dataset-subset-num=300 \
-  --libero-data-dir=/ssd2/EXPO/datasets/libero_goal \
+  --offline-dataset-subset-num=50 \
+  --libero-data-dir=/data/libero_goal \
   --libero-task-suite=libero_goal \
-  --offline-steps=2500 \
+  --offline-steps=1000 \
   --env-reuse-frequency=1 \
   --rollout-interval=10 \
   --eval-interval=500 \
@@ -42,24 +42,24 @@ python openpi_official/scripts/train_pi0_expo.py pi0_expo_libero \
   --max-timesteps=300 \
   --num-steps-wait=10 \
   --capacity=100_000 \
-  --lr-schedule-actor.warmup-steps=1_000 \
+  --lr-schedule-actor.warmup-steps=500 \
   --lr-schedule-actor.peak-lr=2.5e-5 \
   --lr-schedule-actor.decay-steps=30_000 \
   --lr-schedule-actor.decay-lr=2.5e-6 \
-  --lr-schedule-critic.warmup-steps=1_000 \
+  --lr-schedule-critic.warmup-steps=500 \
   --lr-schedule-critic.peak-lr=1.0e-4 \
   --lr-schedule-critic.decay-steps=30_000 \
   --lr-schedule-critic.decay-lr=1.0e-5 \
-  --lr-schedule-edit-actor.warmup-steps=1_000 \
+  --lr-schedule-edit-actor.warmup-steps=500 \
   --lr-schedule-edit-actor.peak-lr=1.0e-5 \
   --lr-schedule-edit-actor.decay-steps=30_000 \
   --lr-schedule-edit-actor.decay-lr=1.0e-6 \
-  --lr-schedule-temp.warmup-steps=1_000 \
+  --lr-schedule-temp.warmup-steps=500 \
   --lr-schedule-temp.peak-lr=1.0e-6 \
   --lr-schedule-temp.decay-steps=30_000 \
   --lr-schedule-temp.decay-lr=1.0e-7 \
   \
-  --buffer.capacity-total=100_000 \
+  --buffer.capacity-total=50_000 \
   --buffer.batch-offline-ratio=0.5 \
   --buffer.success-memory-per-task=10 \
   --buffer.eviction=fifo \

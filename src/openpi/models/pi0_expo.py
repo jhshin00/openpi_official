@@ -484,7 +484,7 @@ class Pi0Expo(_model.BaseModel):
         masks: at.Bool[at.Array, "b"],
         *,
         train: bool = False,
-        retrieval_actions: _model.Actions = None,
+        retrieval_actions: at.Float[at.Array, "*b k ah ad"] = None,
     ) -> at.Float[at.Array, ""]:
 
         rng, rng_sample, rng_obs1, rng_obs2 = jax.random.split(rng, 4)
@@ -518,7 +518,7 @@ class Pi0Expo(_model.BaseModel):
         actions: _model.Actions,
         *,
         train: bool = False,
-        retrieval_actions: _model.Actions = None,
+        retrieval_actions: at.Float[at.Array, "*b k ah ad"] = None,
     ) -> tuple[at.Float[at.Array, ""], at.Float[at.Array, ""]]:
 
         rng, rng_obs = jax.random.split(rng)
@@ -526,7 +526,7 @@ class Pi0Expo(_model.BaseModel):
 
         # Sample actions from edit_actor
         edit_actions, log_probs = self.edit_actor.sample_actions(
-            rng, observation, actions, return_logp=True, train=train, retrieval_actions=retrieval_actions
+            rng, observation, actions, return_logp=True, train=train
         )
         
         # Scale actions and adjust log probabilities
@@ -625,7 +625,7 @@ class Pi0Expo(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         train: bool = False,
-        retrieved_actions : _model.Actions = None,
+        retrieval_actions : at.Float[at.Array, "*b k ah ad"] = None,
     ) -> _model.Actions:
         # [consts]
         H = self.action_horizon
@@ -664,8 +664,8 @@ class Pi0Expo(_model.BaseModel):
         else:
             action_candidates = base_samples # [B,N,H,A]
 
-        if retrieved_actions is not None:
-            action_candidates = jnp.concatenate([action_candidates, retrieved_actions], axis=1) # [B,M,H,A], M=N+n+K
+        if retrieval_actions is not None:
+            action_candidates = jnp.concatenate([action_candidates, retrieval_actions], axis=1) # [B,M,H,A], M=N+n+K
 
         def eval_one(obs_b, acts_bm):
             return jax.vmap(

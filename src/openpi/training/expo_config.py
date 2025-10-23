@@ -33,14 +33,14 @@ ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
 
-@dataclass
+@dataclasses.dataclass
 class BufferConfig:
     capacity_total: int = 100_000         # 총 step 수 기준
     batch_offline_ratio: float = 0.5      # 배치 내 offline:online 비율
     success_memory_per_task: int = 10     # 성공 메모리 크기
     eviction: str = "fifo"                # online eviction 정책
 
-@dataclass
+@dataclasses.dataclass
 class RetrievalConfig:
     enabled: bool = True
     topk: int = 8                         # 한 배치당 후보 traj/action 묶음 개수
@@ -144,8 +144,8 @@ class TrainConfig:
     num_steps_wait: int = 0  # Steps to wait before starting action
     rollout_interval: int = 100  # Rollout interval
 
-    buffer: BufferConfig = BufferConfig()
-    retrieval: RetrievalConfig = RetrievalConfig()
+    buffer: BufferConfig = dataclasses.field(default_factory=BufferConfig)
+    retrieval: RetrievalConfig = dataclasses.field(default_factory=RetrievalConfig)
 
 
     @property
